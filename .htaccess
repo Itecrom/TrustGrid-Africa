@@ -4,8 +4,13 @@ DirectoryIndex index.php
 <IfModule mod_rewrite.c>
   RewriteEngine On
   RewriteRule (^|/)\.(?:git|svn|hg)(?:/|$) - [F,L,NC]
-  RewriteRule ^(index|dashboard|assets|reports)\.html$ $1.php [R=302,L,NC]
-  RewriteRule ^api(?:/.*)?$ api/index.php [QSA,END]
+  RewriteRule ^(?:app|config|database|tools|uploads|public)(?:/|$) - [F,L,NC]
+  RewriteRule ^news/([a-z0-9][a-z0-9-]{0,179})/?$ public/news.php?slug=$1 [QSA,END,NC]
+  RewriteRule ^api(?:/.*)?$ public/api/index.php [QSA,END]
+  RewriteRule ^$ public/index.php [END]
+  RewriteRule ^digital-assets$ public/assets.php [END,NC]
+  RewriteRule ^(about|admin|assessments|contact|dashboard|findings|login|news|pending|platform|profile|register|reports|sitemap)$ public/$1.php [END,NC]
+  RewriteRule ^(about|admin|assessment-pdf|assessments|assets|contact|dashboard|findings|index|login|news|pending|platform|profile-image|profile|register|report-pdf|reports|sitemap)\.php$ public/$1.php [END]
 </IfModule>
 
 <FilesMatch "^(?:\.|composer\.(?:json|lock)|package(?:-lock)?\.json|phpunit\.xml|README(?:\.md)?|Readme\.md|.*\.sql)$">

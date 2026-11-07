@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 if (isset($_SESSION['user_id'])) {
     header('Location: ' . app_url('dashboard.php'));
     exit;
@@ -9,7 +9,7 @@ $pageTitle = 'Contact ITEC ICT SOLUTIONS';
 $pageDescription = 'Call, WhatsApp or visit ITEC ICT SOLUTIONS in Zomba, Malawi.';
 $activePage = 'contact';
 $mapQuery = "ITEC ICT Solutions, Zomba, Malawi, Inside Billys' House, Room Number 5";
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main>
   <section class="interior-hero">
@@ -60,4 +60,4 @@ include __DIR__ . '/app/header.php';
     </div>
   </section>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

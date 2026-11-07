@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 $navUser = require_page_user();
 $pageTitle = 'Security report';
 $activePage = 'reports';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main class="workspace-main" data-workspace-page="reports">
   <section class="workspace-welcome no-print"><div class="container welcome-row"><div><p class="eyebrow">REPORTING &amp; REVIEW</p><h1>Security report</h1><p>A downloadable PDF and printable summary of your organisation’s registered assets and recorded findings.</p></div><div class="report-download-actions"><a class="button button-primary" href="<?= h(app_url('report-pdf.php')) ?>" download>Download PDF report <span aria-hidden="true">↓</span></a><button class="button button-secondary" type="button" data-print-report>Print</button></div></div></section>
@@ -18,4 +18,4 @@ include __DIR__ . '/app/header.php';
     </article>
   </div>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

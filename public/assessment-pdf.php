@@ -1,8 +1,8 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
-require __DIR__ . '/app/assessment_catalog.php';
-require __DIR__ . '/app/pdf_report.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/assessment_catalog.php';
+require dirname(__DIR__) . '/app/pdf_report.php';
 
 $user = require_page_user();
 $assessmentId = filter_var($_GET['id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);

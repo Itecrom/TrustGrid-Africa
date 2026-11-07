@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 if (isset($_SESSION['user_id'])) {
     header('Location: ' . app_url('dashboard.php'));
     exit;
@@ -8,7 +8,7 @@ if (isset($_SESSION['user_id'])) {
 $pageTitle = 'Platform';
 $pageDescription = 'Explore TrustGrid Africa asset management, safe reviews, guided assessments and resilience workflows.';
 $activePage = 'platform';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main>
   <section class="interior-hero">
@@ -45,4 +45,4 @@ include __DIR__ . '/app/header.php';
     </div>
   </section>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

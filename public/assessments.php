@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 $navUser = require_page_user();
 $pageTitle = 'Guided security assessments';
 $activePage = 'assessments';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main class="workspace-main" data-workspace-page="assessments">
   <section class="workspace-welcome">
@@ -61,6 +61,7 @@ include __DIR__ . '/app/header.php';
     <section class="panel assessment-history-panel">
       <div class="panel-head"><div><h2>Your assessment workspace</h2><p>Continue a draft or review a completed assessment and its follow-up actions.</p></div></div>
       <div id="guidedAssessmentList" class="assessment-history-list"><p class="loading-state">Loading assessments…</p></div>
+      <div id="guidedAssessmentPagination"></div>
     </section>
     <section id="guidedAssessmentWorkspace" class="panel guided-assessment-workspace" hidden>
       <div class="guided-workspace-heading">
@@ -86,4 +87,4 @@ include __DIR__ . '/app/header.php';
     </section>
   </div>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

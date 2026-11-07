@@ -1,5 +1,9 @@
 /config/local.php
 /logs/
+/uploads/news/*
+/uploads/profiles/*
+!/uploads/news/.htaccess
+!/uploads/profiles/.htaccess
 /vendor/
 .env
 .env.*

@@ -1,14 +1,14 @@
 (() => {
   const body = document.body;
   const baseUrl = (body.dataset.baseUrl || '').replace(/\/$/, '');
-  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  let csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
   const apiUrl = (path) => `${baseUrl}${path}`;
   const escapeClass = (value) => String(value).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
   const request = async (path, options = {}) => {
     const headers = new Headers(options.headers || {});
     headers.set('Accept', 'application/json');
-    if (options.body) headers.set('Content-Type', 'application/json');
+    if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json');
     if (options.method && options.method !== 'GET') headers.set('X-CSRF-Token', csrfToken);
     let response;
     try {
@@ -72,6 +72,42 @@
     container.classList.toggle('is-success', !isError && text !== '');
   };
 
+  const loadHumanChallenge = async (form) => {
+    const container = form.querySelector('[data-human-challenge]');
+    if (!container) return;
+    const label = container.querySelector('span');
+    try {
+      const challenge = await request('/api/public/challenge');
+      label.textContent = `Human check: ${challenge.question}`;
+      form.elements.challenge_id.value = challenge.challenge_id;
+      form.elements.challenge_answer.value = '';
+    } catch (error) {
+      label.textContent = error.message;
+    }
+  };
+
+  const renderPagination = (containerId, pagination, onPage) => {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    container.replaceChildren();
+    if (!pagination || pagination.pages <= 1) return;
+    const nav = make('nav', 'pagination');
+    nav.setAttribute('aria-label', 'Pages');
+    const add = (page, label, active = false) => {
+      const button = make('button', active ? 'active' : '', label);
+      button.type = 'button';
+      button.disabled = active;
+      button.addEventListener('click', () => onPage(page));
+      nav.append(button);
+    };
+    if (pagination.page > 1) add(pagination.page - 1, 'Previous');
+    const first = Math.max(1, Math.min(pagination.page - 2, pagination.pages - 4));
+    const last = Math.min(pagination.pages, first + 4);
+    for (let page = first; page <= last; page++) add(page, String(page), page === pagination.page);
+    if (pagination.page < pagination.pages) add(pagination.page + 1, 'Next');
+    container.append(nav);
+  };
+
   const bindMenu = () => {
     const toggle = document.querySelector('.menu-toggle');
     const nav = document.getElementById('primaryNav');
@@ -87,6 +123,24 @@
         toggle?.setAttribute('aria-label', 'Open navigation');
         nav.classList.remove('is-open');
       });
+    });
+    document.addEventListener('click', (event) => {
+      document.querySelectorAll('.account-menu[open]').forEach((menu) => {
+        if (!menu.contains(event.target)) menu.removeAttribute('open');
+      });
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') document.querySelectorAll('.account-menu[open]').forEach((menu) => menu.removeAttribute('open'));
+    });
+    document.querySelectorAll('.account-menu .nav-avatar-image').forEach((image) => {
+      const setAvatarVisibility = (available) => {
+        image.hidden = !available;
+        const fallback = image.parentElement?.querySelector('.avatar-initial');
+        if (fallback) fallback.hidden = available;
+      };
+      image.addEventListener('load', () => setAvatarVisibility(true));
+      image.addEventListener('error', () => setAvatarVisibility(false));
+      if (image.complete) setAvatarVisibility(image.naturalWidth > 0);
     });
   };
 
@@ -135,16 +189,19 @@
         const feedback = form.querySelector('[data-form-message]');
         const data = Object.fromEntries(new FormData(form).entries());
         if (data.country === 'OTHER') data.country = 'ZZ';
+        const isRegistration = form.dataset.endpoint === '/api/auth/register';
         submit.disabled = true;
-        message(feedback, 'Securing your workspace…');
+        message(feedback, isRegistration ? 'Submitting your workspace request…' : 'Securing your session…');
         try {
           await request(form.dataset.endpoint, { method: 'POST', body: JSON.stringify(data) });
-          window.location.assign(apiUrl('/dashboard.php'));
+          window.location.assign(apiUrl(isRegistration ? '/pending.php' : '/dashboard.php'));
         } catch (error) {
           message(feedback, error.message, true);
           submit.disabled = false;
+          if (isRegistration) loadHumanChallenge(form);
         }
       });
+        loadHumanChallenge(form);
     });
   };
 
@@ -227,6 +284,109 @@
   };
 
   let allAssets = [];
+  const activeScanPolls = new Set();
+  const localIsoDate = (date) => {
+    const adjusted = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return adjusted.toISOString().slice(0, 10);
+  };
+  const dateAfterDays = (days) => {
+    const date = new Date();
+    date.setDate(date.getDate() + days);
+    return localIsoDate(date);
+  };
+
+  const renderScanSchedule = (asset, container) => {
+    const details = make('details', 'scan-schedule-details');
+    const isActive = asset.scan_schedule_status === 'Active';
+    const summary = make(
+      'summary',
+      '',
+      isActive
+        ? `Automatic checks · ${asset.scan_schedule_frequency} until ${asset.scan_schedule_expires_at.slice(0, 10)}`
+        : asset.scan_schedule_status === 'Paused'
+          ? 'Automatic checks · Paused'
+          : 'Schedule automatic checks'
+    );
+    details.append(summary);
+
+    const form = document.createElement('form');
+    form.className = 'scan-schedule-form';
+    const frequencyLabel = make('label', '', 'Frequency');
+    const frequency = document.createElement('select');
+    frequency.name = 'frequency';
+    frequency.add(new Option('Weekly', 'weekly'));
+    frequency.add(new Option('Daily', 'daily'));
+    frequency.value = asset.scan_schedule_frequency || 'weekly';
+    frequencyLabel.append(frequency);
+
+    const endLabel = make('label', '', 'Authorised through');
+    const endDate = document.createElement('input');
+    endDate.type = 'date';
+    endDate.name = 'authorized_until';
+    endDate.min = dateAfterDays(frequency.value === 'weekly' ? 7 : 1);
+    endDate.max = dateAfterDays(90);
+    endDate.value = asset.scan_schedule_expires_at?.slice(0, 10) || dateAfterDays(30);
+    endDate.required = true;
+    endLabel.append(endDate);
+    frequency.addEventListener('change', () => {
+      endDate.min = dateAfterDays(frequency.value === 'weekly' ? 7 : 1);
+      if (endDate.value < endDate.min) endDate.value = endDate.min;
+    });
+
+    const authorization = make('label', 'checkbox-label', '');
+    const authorizationInput = document.createElement('input');
+    authorizationInput.type = 'checkbox';
+    authorizationInput.name = 'authorization_confirmed';
+    authorizationInput.required = true;
+    const authorizationText = make('span', '', 'I authorize recurring safe reviews until this date.');
+    authorization.append(authorizationInput, authorizationText);
+
+    const feedback = make('p', 'form-message', '');
+    feedback.dataset.formMessage = '';
+    feedback.setAttribute('role', 'status');
+    const save = make('button', 'button button-secondary button-small', isActive ? 'Update schedule' : 'Enable schedule');
+    save.type = 'submit';
+    form.append(frequencyLabel, endLabel, authorization, feedback, save);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      save.disabled = true;
+      try {
+        await request(`/api/assets/${asset.id}/scan-schedule`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            frequency: frequency.value,
+            authorized_until: endDate.value,
+            authorization_confirmed: authorizationInput.checked,
+          }),
+        });
+        allAssets = (await request('/api/assets')).assets;
+        renderAssets(document.querySelector('[data-filter].active')?.dataset.filter || 'all');
+      } catch (error) {
+        message(feedback, error.message, true);
+        save.disabled = false;
+      }
+    });
+    details.append(form, make('small', 'scan-schedule-note', 'Runs only this read-only Website/API review. Schedules expire within 90 days; the worker must be configured by the service operator.'));
+
+    if (isActive) {
+      const pause = make('button', 'scan-schedule-pause', 'Pause schedule');
+      pause.type = 'button';
+      pause.addEventListener('click', async () => {
+        pause.disabled = true;
+        try {
+          await request(`/api/assets/${asset.id}/scan-schedule`, { method: 'DELETE' });
+          allAssets = (await request('/api/assets')).assets;
+          renderAssets(document.querySelector('[data-filter].active')?.dataset.filter || 'all');
+        } catch (error) {
+          window.alert(error.message);
+          pause.disabled = false;
+        }
+      });
+      details.append(pause);
+    }
+    container.append(details);
+  };
+
   const renderAssets = (filter = 'all') => {
     const table = document.getElementById('assetList');
     if (!table) return;
@@ -262,21 +422,28 @@
       if (document.body.dataset.readOnly !== 'true') {
         if (['Website', 'API'].includes(asset.type)) {
           const assetLabel = asset.type === 'API' ? 'API' : 'website';
-          const reviewLabel = asset.type === 'API' ? 'Start safe API review' : 'Start safe review';
+          const reviewLabel = asset.type === 'API' ? 'Queue safe API review' : 'Queue safe review';
           const scanActions = make('div', 'asset-review-actions');
+          const jobPending = ['Queued', 'Running'].includes(asset.latest_job_status);
           const scanButton = make(
             'button',
             'button button-primary button-small',
-            asset.status === 'Archived' ? 'Archived' : reviewLabel
+            asset.status === 'Archived' ? 'Archived' : jobPending ? `Review ${asset.latest_job_status.toLowerCase()}` : reviewLabel
           );
           scanButton.type = 'button';
-          scanButton.disabled = asset.status === 'Archived';
-          if (scanButton.disabled) scanButton.title = 'Archived assets cannot be reviewed.';
+          scanButton.disabled = asset.status === 'Archived' || jobPending;
+          if (asset.status === 'Archived') scanButton.title = 'Archived assets cannot be reviewed.';
+          else if (jobPending) scanButton.title = 'A review job is already queued or running.';
           scanButton.dataset.scanAsset = String(asset.id);
-          scanButton.setAttribute('aria-label', `Start safe ${assetLabel} review for ${asset.name}`);
+          scanButton.setAttribute('aria-label', `Queue safe ${assetLabel} review for ${asset.name}`);
           scanButton.addEventListener('click', () => startWebReview(asset, scanButton));
           scanActions.append(scanButton);
+          if (jobPending) {
+            scanActions.append(make('small', 'scan-job-status', `Review ${asset.latest_job_status.toLowerCase()}`));
+            monitorScanJob(asset, Number(asset.latest_job_id));
+          }
           manage.append(scanActions);
+          renderScanSchedule(asset, manage);
           hasManageAction = true;
         } else if (asset.type === 'Database') {
           if (asset.status === 'Archived') {
@@ -380,6 +547,7 @@
       ? ' Only the configured HTTPS endpoint was requested; response bodies were not stored or inspected.'
       : ' Only the public homepage was checked; the site was not crawled or exploited.';
     summary.textContent = `${scan.summary}${findingSummary} Completed ${scan.completed_at}. Risk indicator: ${scan.risk_score}/100 (${scan.risk_level || 'recorded'}).${limits}`;
+    summary.classList.remove('is-error');
     score.className = `tag ${severityClass(scan.risk_level)}`;
     score.textContent = `${scan.risk_level || 'Risk'} · ${scan.risk_score}/100`;
     checks.replaceChildren();
@@ -393,16 +561,69 @@
     panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   };
 
+  const renderScanJobStatus = (asset, text, isError = false) => {
+    const panel = document.getElementById('webReviewPanel');
+    const summary = document.getElementById('webReviewSummary');
+    const title = document.getElementById('webReviewTitle');
+    const score = document.getElementById('webReviewScore');
+    const checks = document.getElementById('webReviewChecks');
+    if (!panel || !summary || !title || !score || !checks) return;
+    panel.hidden = false;
+    title.textContent = `${asset.name} · ${asset.target}`;
+    summary.textContent = text;
+    summary.classList.toggle('is-error', isError);
+    score.textContent = '';
+    checks.replaceChildren();
+  };
+
+  const monitorScanJob = async (asset, jobId) => {
+    const pollKey = `${asset.id}:${jobId}`;
+    if (!jobId || activeScanPolls.has(pollKey)) return;
+    activeScanPolls.add(pollKey);
+    try {
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, 3000));
+        const result = await request(`/api/assets/${asset.id}/scan-jobs/${jobId}`);
+        if (result.job.status === 'Completed') {
+          const scan = await request(`/api/assets/${asset.id}/scan`);
+          if (scan.scan) renderWebReview(asset, scan.scan);
+          allAssets = (await request('/api/assets')).assets;
+          renderAssets(document.querySelector('[data-filter].active')?.dataset.filter || 'all');
+          await loadDashboardStats();
+          return;
+        }
+        if (['Failed', 'Cancelled'].includes(result.job.status)) {
+          renderScanJobStatus(
+            asset,
+            result.job.error_message || `The review job was ${result.job.status.toLowerCase()}.`,
+            result.job.status === 'Failed'
+          );
+          return;
+        }
+        renderScanJobStatus(
+          asset,
+          `Safe review ${result.job.status.toLowerCase()}. The scan worker processes queued jobs in the background.`
+        );
+      }
+      renderScanJobStatus(asset, 'The review is still queued or running. You can leave this page; its status will be available when you return.');
+    } catch (error) {
+      renderScanJobStatus(asset, `Could not check the review status: ${error.message}`, true);
+    } finally {
+      activeScanPolls.delete(pollKey);
+    }
+  };
+
   const startWebReview = async (asset, button) => {
     const originalText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Reviewing…';
+    button.textContent = 'Queueing…';
     try {
       const result = await request(`/api/assets/${asset.id}/scan`, {
         method: 'POST',
         body: JSON.stringify({ authorization_confirmed: true }),
       });
-      renderWebReview(asset, result.scan);
+      renderScanJobStatus(asset, 'The authorised review is queued. A background worker will process it shortly.');
+      await monitorScanJob(asset, Number(result.job.id));
       try {
         allAssets = (await request('/api/assets')).assets;
         renderAssets(document.querySelector('[data-filter].active')?.dataset.filter || 'all');
@@ -418,6 +639,7 @@
         panel.hidden = false;
         document.getElementById('webReviewTitle').textContent = `Review unavailable · ${asset.name}`;
         summary.textContent = error.message;
+        summary.classList.add('is-error');
         document.getElementById('webReviewScore').textContent = '';
         document.getElementById('webReviewChecks').replaceChildren();
         panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -920,6 +1142,7 @@
         });
         form.reset();
         message(feedback, 'Assessment started. Your progress is saved as you go.');
+        guidedAssessmentPage = 1;
         await loadGuidedAssessments();
         await loadAssessmentEngagements();
         await openGuidedAssessment(result.id);
@@ -1031,16 +1254,724 @@
     });
   };
 
+  const loadProfileDirectory = async (page = 1) => {
+    const container = document.getElementById('profileDirectory');
+    if (!container) return;
+    try {
+      const result = await request(`/api/profiles?page=${page}`);
+      container.replaceChildren();
+      if (result.profiles.length === 0) {
+        container.append(make('p', 'empty-state', 'No active organisation profiles are available.'));
+      }
+      result.profiles.forEach((profile) => {
+        const card = make('article', 'profile-directory-card');
+        if (profile.avatar_path) {
+          const avatar = make('img', 'profile-directory-avatar');
+          avatar.src = apiUrl(`/${profile.avatar_path.replace(/^\/+/, '')}`);
+          avatar.alt = `${profile.full_name} profile picture`;
+          avatar.loading = 'lazy';
+          card.append(avatar);
+        } else {
+          card.append(make('span', 'profile-directory-avatar profile-directory-initial', profile.full_name.slice(0, 1)));
+        }
+        const details = make('div', 'profile-directory-details');
+        details.append(make('h3', '', profile.full_name));
+        const affiliation = [profile.work, profile.school].filter(Boolean).join(' / ');
+        if (affiliation) details.append(make('p', 'profile-directory-affiliation', affiliation));
+        if (profile.bio) details.append(make('p', 'profile-directory-bio', profile.bio));
+        if (profile.qualifications) details.append(make('p', 'profile-directory-qualifications', profile.qualifications));
+        card.append(details);
+        container.append(card);
+      });
+      renderPagination('profileDirectoryPagination', result.pagination, loadProfileDirectory);
+    } catch (error) {
+      container.replaceChildren(make('p', 'form-message is-error', error.message));
+    }
+  };
+
+  const loadProfile = async () => {
+    const form = document.getElementById('profileForm');
+    if (!form) return;
+    try {
+      const { profile } = await request('/api/profile');
+      ['full_name', 'bio', 'school', 'work', 'qualifications'].forEach((key) => {
+        form.elements[key].value = profile[key] || '';
+      });
+      if (profile.avatar_path) {
+        const avatar = document.getElementById('profileAvatarPreview');
+        avatar.src = apiUrl(`/${profile.avatar_path.replace(/^\/+/, '')}`);
+        avatar.hidden = false;
+      }
+    } catch (error) {
+      message(form.querySelector('[data-form-message]'), error.message, true);
+    }
+    await loadProfileDirectory();
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      const data = Object.fromEntries(new FormData(form).entries());
+      button.disabled = true;
+      message(form.querySelector('[data-form-message]'), 'Saving your profile…');
+      try {
+        const result = await request('/api/profile', { method: 'POST', body: JSON.stringify(data) });
+        const navName = document.querySelector('[data-account-name]');
+        if (navName) {
+          navName.textContent = data.full_name;
+          const accountMenu = navName.closest('.account-menu');
+          accountMenu?.querySelector('summary')?.setAttribute('aria-label', `Account options for ${data.full_name}`);
+          const initial = accountMenu?.querySelector('.avatar-initial');
+          if (initial) initial.textContent = [...data.full_name.trim()][0]?.toLocaleUpperCase() || '';
+        }
+        if (result.csrf_token) {
+          csrfToken = result.csrf_token;
+          document.querySelector('meta[name="csrf-token"]').content = csrfToken;
+        }
+        form.elements.current_password.value = '';
+        form.elements.new_password.value = '';
+        message(form.querySelector('[data-form-message]'), 'Your profile was updated.');
+        await loadProfileDirectory();
+      } catch (error) {
+        message(form.querySelector('[data-form-message]'), error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    const avatarInput = document.getElementById('profileAvatarInput');
+    const cropDialog = document.getElementById('avatarCropDialog');
+    const cropCanvas = document.getElementById('avatarCropCanvas');
+    const cropZoom = document.getElementById('avatarCropZoom');
+    const cropSave = document.getElementById('avatarCropSave');
+    if (avatarInput && cropDialog && cropCanvas && cropZoom && cropSave) {
+      const context = cropCanvas.getContext('2d');
+      const cropImage = new Image();
+      const cropSize = cropCanvas.width;
+      let sourceUrl = '';
+      let panX = 0;
+      let panY = 0;
+      let dragging = false;
+      let lastX = 0;
+      let lastY = 0;
+      const drawCrop = () => {
+        if (!context || !cropImage.naturalWidth) return;
+        const zoom = Number(cropZoom.value);
+        const scale = Math.max(cropSize / cropImage.naturalWidth, cropSize / cropImage.naturalHeight) * zoom;
+        const width = cropImage.naturalWidth * scale;
+        const height = cropImage.naturalHeight * scale;
+        const centeredX = (cropSize - width) / 2;
+        const centeredY = (cropSize - height) / 2;
+        panX = Math.max(cropSize - width - centeredX, Math.min(-centeredX, panX));
+        panY = Math.max(cropSize - height - centeredY, Math.min(-centeredY, panY));
+        context.clearRect(0, 0, cropSize, cropSize);
+        context.drawImage(cropImage, centeredX + panX, centeredY + panY, width, height);
+      };
+      const releaseCropSource = () => {
+        if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+        sourceUrl = '';
+        cropImage.removeAttribute('src');
+        avatarInput.value = '';
+      };
+      cropDialog.addEventListener('close', releaseCropSource);
+      avatarInput.addEventListener('change', () => {
+        const file = avatarInput.files?.[0];
+        if (!file) return;
+        if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+          message(form.querySelector('[data-form-message]'), 'Choose a JPEG, PNG or WebP image smaller than 2 MB.', true);
+          avatarInput.value = '';
+          return;
+        }
+        sourceUrl = URL.createObjectURL(file);
+        cropZoom.value = '1';
+        panX = 0;
+        panY = 0;
+        cropImage.onload = () => {
+          drawCrop();
+          cropDialog.showModal();
+        };
+        cropImage.onerror = () => {
+          releaseCropSource();
+          message(form.querySelector('[data-form-message]'), 'The selected image could not be opened.', true);
+        };
+        cropImage.src = sourceUrl;
+      });
+      cropZoom.addEventListener('input', drawCrop);
+      cropCanvas.addEventListener('pointerdown', (event) => {
+        if (!cropImage.naturalWidth) return;
+        dragging = true;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        cropCanvas.setPointerCapture(event.pointerId);
+      });
+      cropCanvas.addEventListener('pointermove', (event) => {
+        if (!dragging) return;
+        const rect = cropCanvas.getBoundingClientRect();
+        const ratio = cropSize / rect.width;
+        panX += (event.clientX - lastX) * ratio;
+        panY += (event.clientY - lastY) * ratio;
+        lastX = event.clientX;
+        lastY = event.clientY;
+        drawCrop();
+      });
+      cropCanvas.addEventListener('pointerup', () => { dragging = false; });
+      cropCanvas.addEventListener('pointercancel', () => { dragging = false; });
+      document.getElementById('avatarCropCancel')?.addEventListener('click', () => cropDialog.close());
+      cropSave.addEventListener('click', async () => {
+        if (!context || !cropImage.naturalWidth) return;
+        cropSave.disabled = true;
+        try {
+          const blob = await new Promise((resolve, reject) => {
+            cropCanvas.toBlob((result) => result ? resolve(result) : reject(new Error('The cropped photo could not be prepared.')), 'image/jpeg', 0.9);
+          });
+          const formData = new FormData();
+          formData.append('avatar', new File([blob], 'profile-photo.jpg', { type: 'image/jpeg' }));
+          const result = await request('/api/profile/avatar', { method: 'POST', body: formData });
+          const avatar = document.getElementById('profileAvatarPreview');
+          avatar.src = `${result.avatar_path}?v=${Date.now()}`;
+          avatar.hidden = false;
+          const navAvatar = document.querySelector('.account-menu .nav-avatar-image');
+          if (navAvatar) {
+            navAvatar.src = `${result.avatar_path}?v=${Date.now()}`;
+            navAvatar.hidden = false;
+            const fallback = navAvatar.parentElement?.querySelector('.avatar-initial');
+            if (fallback) fallback.hidden = true;
+          } else {
+            const navAvatarContainer = document.querySelector('.account-menu .avatar');
+            if (navAvatarContainer) {
+              const navImage = new Image();
+              navImage.className = 'nav-avatar-image';
+              navImage.alt = '';
+              navImage.src = `${result.avatar_path}?v=${Date.now()}`;
+              navImage.addEventListener('load', () => {
+                navImage.hidden = false;
+                const fallback = navAvatarContainer.querySelector('.avatar-initial');
+                if (fallback) fallback.hidden = true;
+              });
+              navImage.addEventListener('error', () => navImage.remove());
+              navImage.hidden = true;
+              navAvatarContainer.append(navImage);
+            }
+          }
+          message(form.querySelector('[data-form-message]'), 'Profile photo updated.');
+          cropDialog.close();
+          await loadProfileDirectory();
+        } catch (error) {
+          message(form.querySelector('[data-form-message]'), error.message, true);
+        } finally {
+          cropSave.disabled = false;
+        }
+      });
+    }
+  };
+
+  const bindNewsComments = () => {
+    const form = document.getElementById('newsCommentForm');
+    if (!form) return;
+    loadHumanChallenge(form);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      const data = Object.fromEntries(new FormData(form).entries());
+      button.disabled = true;
+      try {
+        const result = await request(`/api/news/${encodeURIComponent(form.dataset.newsSlug)}/comments`, {
+          method: 'POST',
+          body: JSON.stringify(data),
+        });
+        form.reset();
+        message(form.querySelector('[data-form-message]'), result.message);
+        await loadHumanChallenge(form);
+      } catch (error) {
+        message(form.querySelector('[data-form-message]'), error.message, true);
+        await loadHumanChallenge(form);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  };
+
+  const bindNewsletterForm = () => {
+    const form = document.getElementById('newsletterForm');
+    if (!form) return;
+    loadHumanChallenge(form);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      const data = Object.fromEntries(new FormData(form).entries());
+      data.consent = form.elements.consent.checked;
+      button.disabled = true;
+      try {
+        const result = await request('/api/newsletter/subscribe', {
+          method: 'POST',
+          body: JSON.stringify(data),
+        });
+        form.reset();
+        message(form.querySelector('[data-form-message]'), result.message);
+        await loadHumanChallenge(form);
+      } catch (error) {
+        message(form.querySelector('[data-form-message]'), error.message, true);
+        await loadHumanChallenge(form);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  };
+
+  const bindWhatsAppWidget = () => {
+    const widget = document.querySelector('[data-whatsapp-widget]');
+    if (!widget) return;
+    const panel = widget.querySelector('#whatsappChatPanel');
+    const toggle = widget.querySelector('[data-whatsapp-toggle]');
+    const close = widget.querySelector('[data-whatsapp-close]');
+    const setOpen = (open) => {
+      panel.hidden = !open;
+      toggle.setAttribute('aria-expanded', String(open));
+      if (open) widget.querySelector('input[name="name"]').focus();
+    };
+    toggle.addEventListener('click', () => setOpen(panel.hidden));
+    close.addEventListener('click', () => setOpen(false));
+    widget.querySelector('[data-whatsapp-form]').addEventListener('submit', (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const name = form.elements.name.value.trim();
+      const text = form.elements.message.value.trim();
+      const messageText = `Hello TrustGrid Africa, my name is ${name}.\n\n${text}`;
+      const url = `https://wa.me/265992919716?text=${encodeURIComponent(messageText)}`;
+      window.open(url, '_blank', 'noopener,noreferrer');
+    });
+  };
+
+  const bindRichEditor = () => {
+    const editor = document.getElementById('adminNewsEditor');
+    if (!editor) return;
+    document.querySelectorAll('[data-editor-command]').forEach((button) => {
+      button.addEventListener('click', () => {
+        editor.focus();
+        document.execCommand(button.dataset.editorCommand, false, button.dataset.editorValue || null);
+      });
+    });
+    document.querySelectorAll('[data-editor-block]').forEach((button) => {
+      button.addEventListener('click', () => {
+        editor.focus();
+        document.execCommand('formatBlock', false, button.dataset.editorBlock);
+      });
+    });
+  };
+
+  const bindSuperAdmin = () => {
+    if (!document.querySelector('[data-super-admin-page]')) return;
+    let workspacePage = 1;
+    let commentPage = 1;
+    let subscriberPage = 1;
+    let newsPage = 1;
+    let logPage = 1;
+    const adminTabs = [...document.querySelectorAll('[data-admin-tab]')];
+    const adminPanels = [...document.querySelectorAll('[data-admin-panel]')];
+    const adminTabList = document.querySelector('.admin-nav');
+    const updateAdminTabOrientation = () => {
+      adminTabList?.setAttribute('aria-orientation', window.matchMedia('(max-width:760px)').matches ? 'horizontal' : 'vertical');
+    };
+    updateAdminTabOrientation();
+    window.matchMedia('(max-width:760px)').addEventListener?.('change', updateAdminTabOrientation);
+    const selectAdminTab = (name, updateHash = true) => {
+      const selected = adminTabs.find((tab) => tab.dataset.adminTab === name) || adminTabs[0];
+      adminTabs.forEach((tab) => {
+        const active = tab === selected;
+        tab.classList.toggle('is-active', active);
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+      });
+      adminPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.adminPanel !== selected.dataset.adminTab;
+      });
+      if (updateHash && window.location.hash !== `#${selected.dataset.adminTab}`) {
+        window.history.replaceState(null, '', `#${selected.dataset.adminTab}`);
+      }
+    };
+    adminTabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectAdminTab(tab.dataset.adminTab));
+      tab.addEventListener('keydown', (event) => {
+        const horizontal = window.matchMedia('(max-width:760px)').matches;
+        const forwardKey = horizontal ? 'ArrowRight' : 'ArrowDown';
+        const backwardKey = horizontal ? 'ArrowLeft' : 'ArrowUp';
+        if (![forwardKey, backwardKey, 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? adminTabs.length - 1
+            : (index + (event.key === forwardKey ? 1 : -1) + adminTabs.length) % adminTabs.length;
+        adminTabs[nextIndex].focus();
+        selectAdminTab(adminTabs[nextIndex].dataset.adminTab);
+      });
+    });
+    document.querySelectorAll('[data-admin-go]').forEach((button) => {
+      button.addEventListener('click', () => {
+        selectAdminTab(button.dataset.adminGo);
+        document.querySelector('.admin-sidebar')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    });
+    window.addEventListener('hashchange', () => selectAdminTab(window.location.hash.slice(1), false));
+    selectAdminTab(window.location.hash.slice(1), false);
+
+    const showError = (element, error) => {
+      if (element) element.replaceChildren(make('p', 'empty-state is-error', error.message));
+    };
+
+    const loadSummary = async () => {
+      try {
+        const result = await request('/api/admin/summary');
+        const counts = result.counts;
+        const container = document.getElementById('adminStats');
+        container.replaceChildren(
+          ...[
+            ['Pending workspaces', counts.pending_workspaces],
+            ['Approved workspaces', counts.active_workspaces],
+            ['Active users', counts.active_users],
+            ['Published articles', counts.published_articles],
+            ['Comments to review', counts.pending_comments],
+            ['Newsletter subscribers', counts.active_subscribers],
+          ].map(([label, value]) => {
+            const card = make('article', 'stat-card');
+            card.append(make('span', '', label), make('strong', '', String(value)));
+            return card;
+          })
+        );
+        const workspaceBadge = document.querySelector('[data-admin-count="workspaces"]');
+        const commentBadge = document.querySelector('[data-admin-count="comments"]');
+        if (workspaceBadge) workspaceBadge.textContent = counts.pending_workspaces > 0 ? String(counts.pending_workspaces) : '';
+        if (commentBadge) commentBadge.textContent = counts.pending_comments > 0 ? String(counts.pending_comments) : '';
+      } catch (error) {
+        showError(document.getElementById('adminStats'), error);
+      }
+    };
+
+    const loadWorkspaces = async () => {
+      const list = document.getElementById('adminWorkspaces');
+      const status = document.getElementById('adminWorkspaceStatus').value;
+      try {
+        const result = await request(`/api/admin/workspaces?status=${encodeURIComponent(status)}&page=${workspacePage}`);
+        list.replaceChildren();
+        if (!result.workspaces.length) list.append(make('p', 'empty-state', 'No workspaces in this status.'));
+        result.workspaces.forEach((workspace) => {
+          const item = make('article', 'admin-record');
+          const info = make('div');
+          info.append(
+            make('h3', '', workspace.name),
+            make('p', '', `${workspace.creator_name} · ${workspace.creator_email} · ${workspace.country} · ${workspace.created_at}`)
+          );
+          item.append(info, make('span', `tag ${workspace.status === 'active' ? 'low' : 'unassessed'}`, workspace.status));
+          if (workspace.status === 'pending') {
+            const actions = make('div', 'admin-record-actions');
+            [['approve', 'Approve'], ['reject', 'Reject']].forEach(([decision, label]) => {
+              const button = make('button', decision === 'approve' ? 'button button-primary button-small' : 'button button-secondary button-small', label);
+              button.type = 'button';
+              button.addEventListener('click', async () => {
+                if (decision === 'reject' && !window.confirm(`Reject workspace request "${workspace.name}"?`)) return;
+                button.disabled = true;
+                try {
+                  await request(`/api/admin/workspaces/${workspace.id}/decision`, {
+                    method: 'POST',
+                    body: JSON.stringify({ decision }),
+                  });
+                  await Promise.all([loadWorkspaces(), loadSummary(), loadLogs()]);
+                } catch (error) {
+                  window.alert(error.message);
+                  button.disabled = false;
+                }
+              });
+              actions.append(button);
+            });
+            item.append(actions);
+          }
+          list.append(item);
+        });
+        renderPagination('adminWorkspacePagination', result.pagination, (page) => {
+          workspacePage = page;
+          loadWorkspaces();
+        });
+      } catch (error) {
+        showError(list, error);
+      }
+    };
+
+    const loadComments = async () => {
+      const list = document.getElementById('adminComments');
+      const status = document.getElementById('adminCommentStatus').value;
+      try {
+        const result = await request(`/api/admin/comments?status=${encodeURIComponent(status)}&page=${commentPage}`);
+        list.replaceChildren();
+        if (!result.comments.length) list.append(make('p', 'empty-state', 'No comments need review in this status.'));
+        result.comments.forEach((comment) => {
+          const item = make('article', 'admin-record');
+          const info = make('div');
+          info.append(
+            make('h3', '', comment.article_title),
+            make('p', '', `${comment.display_name} · ${comment.email} · ${comment.created_at}`),
+            make('p', 'admin-comment-text', comment.body_text)
+          );
+          item.append(info, make('span', `tag ${comment.status === 'Approved' ? 'low' : 'unassessed'}`, comment.status));
+          if (comment.status === 'Pending') {
+            const actions = make('div', 'admin-record-actions');
+            [['approve', 'Approve'], ['reject', 'Reject']].forEach(([decision, label]) => {
+              const button = make('button', 'button button-secondary button-small', label);
+              button.type = 'button';
+              button.addEventListener('click', async () => {
+                button.disabled = true;
+                try {
+                  await request(`/api/admin/comments/${comment.id}/decision`, {
+                    method: 'POST',
+                    body: JSON.stringify({ decision }),
+                  });
+                  await Promise.all([loadComments(), loadSummary(), loadLogs()]);
+                } catch (error) {
+                  window.alert(error.message);
+                  button.disabled = false;
+                }
+              });
+              actions.append(button);
+            });
+            item.append(actions);
+          }
+          list.append(item);
+        });
+        renderPagination('adminCommentPagination', result.pagination, (page) => {
+          commentPage = page;
+          loadComments();
+        });
+      } catch (error) {
+        showError(list, error);
+      }
+    };
+
+    const loadSubscribers = async () => {
+      const list = document.getElementById('adminSubscribers');
+      const status = document.getElementById('adminSubscriberStatus').value;
+      try {
+        const result = await request(`/api/admin/subscribers?status=${encodeURIComponent(status)}&page=${subscriberPage}`);
+        list.replaceChildren();
+        if (!result.subscribers.length) list.append(make('p', 'empty-state', 'No subscribers in this status.'));
+        result.subscribers.forEach((subscriber) => {
+          const item = make('article', 'admin-record');
+          const info = make('div');
+          info.append(
+            make('h3', '', subscriber.email),
+            make('p', '', `${subscriber.name || 'No name provided'} · Opted in ${subscriber.consent_at}`)
+          );
+          item.append(info, make('span', `tag ${subscriber.status === 'Active' ? 'low' : 'unassessed'}`, subscriber.status));
+          if (subscriber.status === 'Active') {
+            const actions = make('div', 'admin-record-actions');
+            const unsubscribe = make('button', 'button button-secondary button-small', 'Unsubscribe');
+            unsubscribe.type = 'button';
+            unsubscribe.addEventListener('click', async () => {
+              if (!window.confirm(`Unsubscribe ${subscriber.email} from future updates?`)) return;
+              unsubscribe.disabled = true;
+              try {
+                await request(`/api/admin/subscribers/${subscriber.id}/unsubscribe`, { method: 'POST', body: '{}' });
+                await Promise.all([loadSubscribers(), loadSummary(), loadLogs()]);
+              } catch (error) {
+                window.alert(error.message);
+                unsubscribe.disabled = false;
+              }
+            });
+            actions.append(unsubscribe);
+            item.append(actions);
+          }
+          list.append(item);
+        });
+        renderPagination('adminSubscriberPagination', result.pagination, (page) => {
+          subscriberPage = page;
+          loadSubscribers();
+        });
+      } catch (error) {
+        showError(list, error);
+      }
+    };
+
+    const form = document.getElementById('adminNewsForm');
+    const editor = document.getElementById('adminNewsEditor');
+    const imagePreview = document.getElementById('adminNewsImagePreview');
+    const resetNewsForm = () => {
+      form.reset();
+      editor.replaceChildren();
+      form.elements.id.value = '';
+      form.elements.featured_image_path.value = '';
+      imagePreview.removeAttribute('src');
+      imagePreview.hidden = true;
+      message(form.querySelector('[data-form-message]'), '');
+    };
+
+    const loadNews = async () => {
+      const list = document.getElementById('adminNewsList');
+      try {
+        const result = await request(`/api/admin/news?page=${newsPage}`);
+        list.replaceChildren();
+        if (!result.articles.length) list.append(make('p', 'empty-state', 'No articles yet. Create one above.'));
+        result.articles.forEach((article) => {
+          const item = make('article', 'admin-record');
+          const info = make('div');
+          info.append(
+            make('h3', '', article.title),
+            make('p', '', `${article.status} · ${article.author_name} · ${article.updated_at}`)
+          );
+          if (article.status === 'Published') {
+            const link = make('a', 'text-link', `/${'news'}/${article.slug}`);
+            link.href = apiUrl(`/news/${encodeURIComponent(article.slug)}`);
+            info.append(link);
+          }
+          const actions = make('div', 'admin-record-actions');
+          const edit = make('button', 'button button-secondary button-small', 'Edit');
+          edit.type = 'button';
+          edit.addEventListener('click', async () => {
+            try {
+              const detail = await request(`/api/admin/news/${article.id}`);
+              const record = detail.article;
+              form.elements.id.value = record.id;
+              form.elements.title.value = record.title;
+              form.elements.summary.value = record.summary;
+              form.elements.status.value = record.status === 'Archived' ? 'Draft' : record.status;
+              form.elements.featured_image_path.value = record.featured_image_path;
+              editor.innerHTML = record.body_html;
+              imagePreview.src = record.featured_image_path ? apiUrl(`/${record.featured_image_path}`) : '';
+              imagePreview.hidden = !record.featured_image_path;
+              form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            } catch (error) {
+              window.alert(error.message);
+            }
+          });
+          actions.append(edit);
+          const remove = make('button', 'button button-secondary button-small', 'Delete');
+          remove.type = 'button';
+          remove.addEventListener('click', async () => {
+            if (!window.confirm(`Permanently delete "${article.title}" and its comments?`)) return;
+            remove.disabled = true;
+            try {
+              await request(`/api/admin/news/${article.id}`, { method: 'DELETE' });
+              await Promise.all([loadNews(), loadSummary(), loadLogs()]);
+            } catch (error) {
+              window.alert(error.message);
+              remove.disabled = false;
+            }
+          });
+          actions.append(remove);
+          item.append(info, make('span', `tag ${article.status === 'Published' ? 'low' : 'unassessed'}`, article.status), actions);
+          list.append(item);
+        });
+        renderPagination('adminNewsPagination', result.pagination, (page) => {
+          newsPage = page;
+          loadNews();
+        });
+      } catch (error) {
+        showError(list, error);
+      }
+    };
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      const data = Object.fromEntries(new FormData(form).entries());
+      data.body_html = editor.innerHTML;
+      if (!data.body_html.trim()) {
+        message(form.querySelector('[data-form-message]'), 'Write the article before saving.', true);
+        return;
+      }
+      button.disabled = true;
+      message(form.querySelector('[data-form-message]'), 'Saving article…');
+      try {
+        const id = form.elements.id.value;
+        if (id) {
+          await request(`/api/admin/news/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
+        } else {
+          await request('/api/admin/news', { method: 'POST', body: JSON.stringify(data) });
+        }
+        resetNewsForm();
+        message(form.querySelector('[data-form-message]'), 'Article saved.');
+        await Promise.all([loadNews(), loadSummary(), loadLogs()]);
+      } catch (error) {
+        message(form.querySelector('[data-form-message]'), error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    document.getElementById('adminNewsReset').addEventListener('click', resetNewsForm);
+    form.elements.image.addEventListener('change', async (event) => {
+      const file = event.currentTarget.files?.[0];
+      if (!file) return;
+      const upload = new FormData();
+      upload.append('image', file);
+      message(form.querySelector('[data-form-message]'), 'Uploading featured image…');
+      try {
+        const result = await request('/api/admin/news-image', { method: 'POST', body: upload });
+        form.elements.featured_image_path.value = result.featured_image_path;
+        imagePreview.src = apiUrl(`/${result.featured_image_path}`);
+        imagePreview.hidden = false;
+        message(form.querySelector('[data-form-message]'), 'Featured image uploaded.');
+      } catch (error) {
+        message(form.querySelector('[data-form-message]'), error.message, true);
+        event.currentTarget.value = '';
+      }
+    });
+
+    const loadLogs = async () => {
+      const list = document.getElementById('adminLogs');
+      try {
+        const result = await request(`/api/admin/logs?page=${logPage}`);
+        list.replaceChildren();
+        if (!result.logs.length) list.append(make('p', 'empty-state', 'No user activity recorded yet.'));
+        result.logs.forEach((log) => {
+          const row = make('article', 'admin-log-row');
+          row.append(
+            make('time', '', log.created_at),
+            make('strong', '', log.action),
+            make('span', '', log.actor_name || 'Public visitor'),
+            make('span', '', log.organization_name || 'Platform'),
+            make('span', '', `${log.target_type}${log.target_id ? ` #${log.target_id}` : ''}`)
+          );
+          list.append(row);
+        });
+        renderPagination('adminLogPagination', result.pagination, (page) => {
+          logPage = page;
+          loadLogs();
+        });
+      } catch (error) {
+        showError(list, error);
+      }
+    };
+
+    document.getElementById('adminWorkspaceStatus').addEventListener('change', () => {
+      workspacePage = 1;
+      loadWorkspaces();
+    });
+    document.getElementById('adminCommentStatus').addEventListener('change', () => {
+      commentPage = 1;
+      loadComments();
+    });
+    document.getElementById('adminSubscriberStatus').addEventListener('change', () => {
+      subscriberPage = 1;
+      loadSubscribers();
+    });
+    bindRichEditor();
+    Promise.all([loadSummary(), loadWorkspaces(), loadComments(), loadSubscribers(), loadNews(), loadLogs()]);
+  };
+
   const loadGuidedAssessments = async () => {
     const list = document.getElementById('guidedAssessmentList');
     if (!list) return [];
-    const result = await request('/api/assessments/guided');
+    const result = await request(`/api/assessments/guided?page=${guidedAssessmentPage}`);
     renderGuidedAssessmentList(result.assessments);
+    renderPagination('guidedAssessmentPagination', result.pagination, (page) => {
+      guidedAssessmentPage = page;
+      loadGuidedAssessments().catch((error) => message(document.getElementById('guidedAssessmentMessage'), error.message, true));
+    });
     return result.assessments;
   };
 
   let allFindings = [];
   let selectedFindingsAssetId = '';
+  let selectedFindingsStatus = '';
+  let findingsPage = 1;
+  let guidedAssessmentPage = 1;
   const renderFindings = (filter = 'all') => {
     const list = document.getElementById('findingsList');
     if (!list) return;
@@ -1094,6 +2025,21 @@
         });
         const controls = make('div', 'finding-controls');
         controls.append(make('span', '', 'Update status'), selector);
+        const deleteButton = make('button', 'finding-delete-button', 'Delete finding');
+        deleteButton.type = 'button';
+        deleteButton.setAttribute('aria-label', `Delete finding: ${finding.title}`);
+        deleteButton.addEventListener('click', async () => {
+          if (!window.confirm(`Permanently delete "${finding.title}" from this organisation's findings? This cannot be undone.`)) return;
+          deleteButton.disabled = true;
+          try {
+            await request(`/api/findings/${finding.id}`, { method: 'DELETE' });
+            await Promise.all([loadFindings(), loadDashboardStats()]);
+          } catch (error) {
+            window.alert(`The finding could not be deleted: ${error.message}`);
+            deleteButton.disabled = false;
+          }
+        });
+        controls.append(deleteButton);
         card.append(controls);
       }
       list.append(card);
@@ -1145,12 +2091,20 @@
   };
 
   const loadFindings = async (assetId = selectedFindingsAssetId) => {
-    selectedFindingsAssetId = String(assetId || '');
-    const query = selectedFindingsAssetId
-      ? `?asset_id=${encodeURIComponent(selectedFindingsAssetId)}`
-      : '';
+    const nextAssetId = String(assetId || '');
+    if (nextAssetId !== selectedFindingsAssetId) findingsPage = 1;
+    selectedFindingsAssetId = nextAssetId;
+    const params = new URLSearchParams({ page: String(findingsPage) });
+    if (selectedFindingsAssetId) params.set('asset_id', selectedFindingsAssetId);
+    if (selectedFindingsStatus) params.set('status', selectedFindingsStatus);
+    const query = `?${params}`;
     const result = await request(`/api/findings${query}`);
     allFindings = result.findings;
+    findingsPage = result.pagination.page;
+    renderPagination('findingsPagination', result.pagination, (page) => {
+      findingsPage = page;
+      loadFindings(selectedFindingsAssetId).catch((error) => message(document.getElementById('findingsSummary'), error.message, true));
+    });
     renderFindings(document.querySelector('[data-finding-filter].active')?.dataset.findingFilter || 'all');
     const summary = document.getElementById('findingsSummary');
     if (summary) {
@@ -1160,10 +2114,10 @@
       const selectedAsset = allAssets.find((asset) => String(asset.id) === selectedFindingsAssetId);
       summary.replaceChildren(
         ...(selectedAsset ? [make('span', '', `Findings for ${selectedAsset.name}`)] : []),
-        make('span', '', `${allFindings.length} total`),
-        make('span', '', `${open} open`),
-        make('span', '', `${progress} in progress`),
-        make('span', '', `${resolved} resolved`)
+        make('span', '', `${result.summary.total} total`),
+        make('span', '', `${result.summary.open} open`),
+        make('span', '', `${result.summary.in_progress} in progress`),
+        make('span', '', `${result.summary.resolved} resolved`)
       );
     }
     return result.findings;
@@ -1215,7 +2169,12 @@
     button.addEventListener('click', () => {
       document.querySelectorAll('[data-finding-filter]').forEach((node) => node.classList.remove('active'));
       button.classList.add('active');
-      renderFindings(button.dataset.findingFilter);
+      selectedFindingsStatus = button.dataset.findingFilter === 'all' ? '' : button.dataset.findingFilter;
+      findingsPage = 1;
+      loadFindings().catch((error) => {
+        const list = document.getElementById('findingsList');
+        if (list) list.replaceChildren(make('p', 'empty-state is-error', error.message));
+      });
     });
   });
   document.querySelector('[data-print-report]')?.addEventListener('click', () => window.print());
@@ -1229,5 +2188,10 @@
   bindFindingForm();
   bindGuidedAssessment();
   bindEngagementForm();
+  bindNewsComments();
+  bindNewsletterForm();
+  bindWhatsAppWidget();
+  loadProfile();
+  bindSuperAdmin();
   loadWorkspace();
 })();

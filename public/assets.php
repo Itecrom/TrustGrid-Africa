@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 $navUser = require_page_user();
 $pageTitle = 'Digital asset register';
 $activePage = 'assets';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main class="workspace-main" data-workspace-page="assets">
   <section class="workspace-welcome"><div class="container welcome-row"><div><p class="eyebrow">YOUR DIGITAL FOOTPRINT</p><h1>Digital asset register</h1><p>Keep track of the services your organisation owns or is authorised to manage.</p></div><span class="badge-pill">PRIVATE TO YOUR ORGANISATION</span></div></section>
@@ -45,4 +45,4 @@ include __DIR__ . '/app/header.php';
     </section>
   </div>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

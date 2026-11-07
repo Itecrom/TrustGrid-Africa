@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 $navUser = require_page_user();
 $pageTitle = 'Security overview';
 $activePage = 'dashboard';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main class="workspace-main" data-workspace-page="dashboard">
   <section class="workspace-welcome"><div class="container welcome-row"><div><p class="eyebrow">ORGANISATION OVERVIEW</p><h1>Good to see you, <?= h(explode(' ', $navUser['full_name'])[0]) ?>.</h1><p>A clear view of your digital assets and the security work ahead.</p></div><a class="button button-primary" href="<?= h(app_url('assets.php')) ?>">Add a digital asset <span>＋</span></a></div></section>
@@ -34,4 +34,4 @@ include __DIR__ . '/app/header.php';
     <p class="data-boundary-note"><span>◇</span> Your organisation controls its own asset inventory and security findings. No asset is scanned automatically.</p>
   </div>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

@@ -1,10 +1,10 @@
 <?php
 declare(strict_types=1);
-require __DIR__ . '/app/bootstrap.php';
+require dirname(__DIR__) . '/app/bootstrap.php';
 $navUser = require_page_user();
 $pageTitle = 'Security findings';
 $activePage = 'findings';
-include __DIR__ . '/app/header.php';
+include dirname(__DIR__) . '/app/header.php';
 ?>
 <main class="workspace-main" data-workspace-page="findings">
   <section class="workspace-welcome"><div class="container welcome-row"><div><p class="eyebrow">REMEDIATION &amp; MONITORING</p><h1>Security findings</h1><p>Review identified issues, assign follow-up with your team and track progress.</p></div><span class="badge-pill">ORGANISATION-ONLY DATA</span></div></section>
@@ -24,8 +24,8 @@ include __DIR__ . '/app/header.php';
       </form>
     </section>
     <?php endif; ?>
-    <section class="panel findings-panel"><div class="panel-head"><div><h2>Finding register</h2><p>Choose an asset to see its findings, including issues found automatically during website reviews.</p></div><div class="finding-register-filters"><label for="findingsAssetFilter">Show findings for</label><select id="findingsAssetFilter"><option value="">All assets</option></select><div class="segmented" aria-label="Filter findings by status"><button class="chip active" type="button" data-finding-filter="all">All</button><button class="chip" type="button" data-finding-filter="Open">Open</button><button class="chip" type="button" data-finding-filter="In progress">In progress</button><button class="chip" type="button" data-finding-filter="Resolved">Resolved</button></div></div></div><div id="findingsList" class="findings-list"><p class="loading-state">Loading findings…</p></div></section>
+    <section class="panel findings-panel"><div class="panel-head"><div><h2>Finding register</h2><p>Choose an asset to see its findings, including issues found automatically during website reviews.</p></div><div class="finding-register-filters"><label for="findingsAssetFilter">Show findings for</label><select id="findingsAssetFilter"><option value="">All assets</option></select><div class="segmented" aria-label="Filter findings by status"><button class="chip active" type="button" data-finding-filter="all">All</button><button class="chip" type="button" data-finding-filter="Open">Open</button><button class="chip" type="button" data-finding-filter="In progress">In progress</button><button class="chip" type="button" data-finding-filter="Resolved">Resolved</button></div></div></div><div id="findingsList" class="findings-list"><p class="loading-state">Loading findings…</p></div><div id="findingsPagination"></div></section>
     <p class="data-boundary-note"><span>◇</span> Website reviews are limited to basic homepage configuration checks and do not replace a professional security assessment.</p>
   </div>
 </main>
-<?php include __DIR__ . '/app/footer.php'; ?>
+<?php include dirname(__DIR__) . '/app/footer.php'; ?>

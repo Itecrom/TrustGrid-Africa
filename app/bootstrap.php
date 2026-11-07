@@ -41,7 +41,11 @@ function app_base_path(): string
     if ($directory === '/') {
         $directory = '';
     }
-    if (str_ends_with($directory, '/api')) {
+    if (str_ends_with($directory, '/public/api')) {
+        $directory = substr($directory, 0, -11);
+    } elseif (str_ends_with($directory, '/public')) {
+        $directory = substr($directory, 0, -7);
+    } elseif (str_ends_with($directory, '/api')) {
         $directory = substr($directory, 0, -4);
     }
 
@@ -50,7 +54,23 @@ function app_base_path(): string
 
 function app_url(string $path = ''): string
 {
-    return app_base_path() . '/' . ltrim($path, '/');
+    $basePath = app_base_path();
+    $path = ltrim($path, '/');
+    if ($path === 'index.php') {
+        return $basePath . '/';
+    }
+    if ($path === 'assets.php') {
+        return $basePath . '/digital-assets';
+    }
+    if (preg_match(
+        '/^(about|admin|assessments|contact|dashboard|findings|login|news|pending|platform|profile|register|reports|sitemap)\.php$/',
+        $path,
+        $matches
+    ) === 1) {
+        return $basePath . '/' . $matches[1];
+    }
+
+    return $basePath . '/' . $path;
 }
 
 function h(mixed $value): string
@@ -129,10 +149,11 @@ function current_user(): ?array
     }
 
     $statement = db()->prepare(
-        'SELECT u.id, u.organization_id, u.full_name, u.email, u.role,
+        'SELECT u.id, u.organization_id, u.full_name, u.email, u.role, p.avatar_path,
                 o.name AS organization_name, o.country
          FROM users u
          JOIN organizations o ON o.id = u.organization_id
+         LEFT JOIN user_profiles p ON p.user_id = u.id
          WHERE u.id = :id AND u.status = "active" AND o.status = "active"
          LIMIT 1'
     );
@@ -206,4 +227,13 @@ try {
     header('Content-Type: text/plain; charset=utf-8');
     exit('TrustGrid Africa is not configured. Follow the local setup instructions and try again.');
 }
+set_exception_handler(static function (Throwable $exception): void {
+    error_log('TrustGrid page request failed: ' . $exception->getMessage());
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Cache-Control: no-store');
+    }
+    echo 'The service could not complete this request.';
+});
 start_app_session();

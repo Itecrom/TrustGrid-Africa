@@ -1,11 +1,12 @@
 <?php
 declare(strict_types=1);
 
-require __DIR__ . '/../app/bootstrap.php';
-require __DIR__ . '/../app/http.php';
-require __DIR__ . '/../app/safe_web_review.php';
-require __DIR__ . '/../app/assessment_catalog.php';
-require __DIR__ . '/../app/platform.php';
+require dirname(__DIR__, 2) . '/app/bootstrap.php';
+require dirname(__DIR__, 2) . '/app/http.php';
+require dirname(__DIR__, 2) . '/app/safe_web_review.php';
+require dirname(__DIR__, 2) . '/app/assessment_catalog.php';
+require dirname(__DIR__, 2) . '/app/platform.php';
+require dirname(__DIR__, 2) . '/app/scan_jobs.php';
 
 try {
     $path = rawurldecode((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/'));
@@ -17,7 +18,7 @@ try {
     $method = strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 
     if ($method === 'OPTIONS') {
-        header('Allow: GET, POST, PATCH, DELETE, OPTIONS');
+        header('Allow: GET, POST, PUT, PATCH, DELETE, OPTIONS');
         http_response_code(204);
         exit;
     }
@@ -49,6 +50,8 @@ try {
         $count->execute($parameters);
         $total = (int) $count->fetchColumn();
         $limit = 9;
+        $pages = max(1, (int) ceil($total / $limit));
+        $page = min($page, $pages);
         $offset = ($page - 1) * $limit;
         $statement = $pdo->prepare(
             'SELECT id, slug, title, summary, featured_image_path, published_at
@@ -69,7 +72,7 @@ try {
         json_response(['data' => [
             'articles' => $statement->fetchAll(),
             'latest' => $latest->fetchAll(),
-            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => max(1, (int) ceil($total / $limit))],
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => $pages],
             'query' => $search,
         ]]);
     }
@@ -93,11 +96,14 @@ try {
         );
         $count->execute(['article_id' => (int) $article['id']]);
         $total = (int) $count->fetchColumn();
+        $pages = max(1, (int) ceil($total / $limit));
+        $page = min($page, $pages);
         $comments = db()->prepare(
             'SELECT display_name, body_text, created_at FROM news_comments
              WHERE article_id = :article_id AND status = "Approved"
              ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset'
         );
+        $article['body_html'] = sanitize_news_html((string) $article['body_html']);
         $comments->bindValue(':article_id', (int) $article['id'], PDO::PARAM_INT);
         $comments->bindValue(':limit', $limit, PDO::PARAM_INT);
         $comments->bindValue(':offset', ($page - 1) * $limit, PDO::PARAM_INT);
@@ -105,7 +111,7 @@ try {
         json_response(['data' => [
             'article' => $article,
             'comments' => $comments->fetchAll(),
-            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => max(1, (int) ceil($total / $limit))],
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => $pages],
         ]]);
     }
 
@@ -143,6 +149,32 @@ try {
         ]);
         record_user_action($currentUser === null ? null : (int) $currentUser['id'], null, 'news.comment_submitted', 'news_comment', (int) db()->lastInsertId());
         json_response(['data' => ['submitted' => true, 'message' => 'Your comment is awaiting moderator approval.']], 202);
+    }
+
+    if ($route === '/newsletter/subscribe' && $method === 'POST') {
+        $input = request_json();
+        verify_public_form_challenge($input);
+        enforce_public_form_limit(db(), 'newsletter-subscribe', 3, 3600);
+        $email = strtolower(required_string($input, 'email', 254, 'Email'));
+        $name = optional_string($input, 'name', 120, 'Name');
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            throw new ApiException(422, 'Enter a valid email address.');
+        }
+        if (($input['consent'] ?? false) !== true) {
+            throw new ApiException(422, 'Confirm that you want to receive TrustGrid Africa news.');
+        }
+        $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+        $ipHash = $ip === '' ? null : hash_hmac('sha256', 'newsletter:' . $ip, app_config()['app_key']);
+        db()->prepare(
+            'INSERT INTO news_subscribers (email, name, ip_hash)
+             VALUES (:email, :name, :ip_hash)
+             ON DUPLICATE KEY UPDATE name = VALUES(name), status = "Active",
+               consent_at = UTC_TIMESTAMP(), unsubscribed_at = NULL, ip_hash = VALUES(ip_hash)'
+        )->execute(['email' => $email, 'name' => $name, 'ip_hash' => $ipHash]);
+        $subscriberQuery = db()->prepare('SELECT id FROM news_subscribers WHERE email = :email');
+        $subscriberQuery->execute(['email' => $email]);
+        record_user_action(null, null, 'newsletter.subscribed', 'newsletter_subscriber', (int) $subscriberQuery->fetchColumn());
+        json_response(['data' => ['subscribed' => true, 'message' => 'You are subscribed to TrustGrid Africa news.']], 201);
     }
 
     if ($route === '/auth/register' && $method === 'POST') {
@@ -248,14 +280,19 @@ try {
                  SET attempts = attempts + 1, window_started_at = COALESCE(window_started_at, UTC_TIMESTAMP())
                  WHERE ip_hash = :ip_hash'
             )->execute(['ip_hash' => $ipHash]);
+            record_user_action(null, null, 'auth.login_failed', 'auth');
             $pdo->commit();
             throw new ApiException(401, 'The email or password is incorrect.');
         }
         if ($account['organization_status'] === 'pending') {
+            record_user_action((int) $account['id'], (int) $account['organization_id'], 'auth.login_blocked_pending', 'user', (int) $account['id']);
             $pdo->commit();
             throw new ApiException(403, 'Your workspace is awaiting super-admin approval.');
         }
         if ($account['organization_status'] !== 'active') {
+            record_user_action((int) $account['id'], (int) $account['organization_id'], 'auth.login_blocked_workspace', 'user', (int) $account['id'], [
+                'workspace_status' => $account['organization_status'],
+            ]);
             $pdo->commit();
             throw new ApiException(403, 'This workspace is not available.');
         }
@@ -270,7 +307,8 @@ try {
     }
 
     if ($route === '/auth/logout' && $method === 'POST') {
-        require_api_user();
+        $logoutUser = require_api_user();
+        record_user_action((int) $logoutUser['id'], organization_id($logoutUser), 'auth.logout', 'user', (int) $logoutUser['id']);
         $_SESSION = [];
         if (ini_get('session.use_cookies')) {
             $params = session_get_cookie_params();
@@ -294,6 +332,40 @@ try {
     $user = require_api_user();
     $orgId = organization_id($user);
 
+    if ($route === '/profiles' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $count = db()->prepare('SELECT COUNT(*) FROM users WHERE organization_id = :organization_id AND status = "active"');
+        $count->execute(['organization_id' => $orgId]);
+        $total = (int) $count->fetchColumn();
+        $limit = 20;
+        $pages = max(1, (int) ceil($total / $limit));
+        $page = min($page, $pages);
+        $statement = db()->prepare(
+            'SELECT u.id, u.full_name, p.bio, p.avatar_path, p.school, p.work, p.qualifications
+             FROM users u
+             LEFT JOIN user_profiles p ON p.user_id = u.id
+             WHERE u.organization_id = :organization_id AND u.status = "active"
+             ORDER BY u.full_name, u.id
+             LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':organization_id', $orgId, PDO::PARAM_INT);
+        $statement->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * $limit, PDO::PARAM_INT);
+        $statement->execute();
+        $profiles = $statement->fetchAll();
+        foreach ($profiles as &$profile) {
+            $profile['id'] = (int) $profile['id'];
+            if ($profile['avatar_path'] !== '') {
+                $profile['avatar_path'] = 'profile-image.php?user_id=' . $profile['id'];
+            }
+        }
+        unset($profile);
+        json_response(['data' => [
+            'profiles' => $profiles,
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => $pages],
+        ]]);
+    }
+
     if ($route === '/profile' && $method === 'GET') {
         $statement = db()->prepare(
             'SELECT u.full_name, u.email, u.role, p.bio, p.avatar_path, p.school, p.work, p.qualifications,
@@ -303,7 +375,11 @@ try {
              WHERE u.id = :user_id AND u.organization_id = :organization_id'
         );
         $statement->execute(['user_id' => (int) $user['id'], 'organization_id' => $orgId]);
-        json_response(['data' => ['profile' => $statement->fetch()]]);
+        $profile = $statement->fetch();
+        if ($profile !== false && $profile['avatar_path'] !== '') {
+            $profile['avatar_path'] = 'profile-image.php';
+        }
+        json_response(['data' => ['profile' => $profile]]);
     }
 
     if ($route === '/profile' && $method === 'POST') {
@@ -314,6 +390,19 @@ try {
         $work = optional_string($input, 'work', 180, 'Workplace');
         $qualifications = optional_string($input, 'qualifications', 3000, 'Qualifications');
         $pdo = db();
+        $newPassword = $input['new_password'] ?? '';
+        if ($newPassword !== '') {
+            $currentPassword = $input['current_password'] ?? null;
+            if (!is_string($currentPassword) || !is_string($newPassword)
+                || strlen($newPassword) < 12 || strlen($newPassword) > 200) {
+                throw new ApiException(422, 'Enter your current password and a new password of 12-200 characters.');
+            }
+            $passwordQuery = $pdo->prepare('SELECT password_hash FROM users WHERE id = :id');
+            $passwordQuery->execute(['id' => (int) $user['id']]);
+            if (!password_verify($currentPassword, (string) $passwordQuery->fetchColumn())) {
+                throw new ApiException(403, 'The current password is incorrect.');
+            }
+        }
         $pdo->beginTransaction();
         try {
             $pdo->prepare(
@@ -335,15 +424,29 @@ try {
                 'work' => $work,
                 'qualifications' => $qualifications,
             ]);
+            if ($newPassword !== '') {
+                $pdo->prepare('UPDATE users SET password_hash = :password_hash WHERE id = :id')
+                    ->execute(['password_hash' => password_hash($newPassword, PASSWORD_DEFAULT), 'id' => (int) $user['id']]);
+            }
             record_user_action((int) $user['id'], $orgId, 'profile.updated', 'user', (int) $user['id']);
+            if ($newPassword !== '') {
+                record_user_action((int) $user['id'], $orgId, 'auth.password_changed', 'user', (int) $user['id']);
+            }
             $pdo->commit();
+            if ($newPassword !== '') {
+                session_regenerate_id(true);
+                $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+            }
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
             throw $exception;
         }
-        json_response(['data' => ['updated' => true]]);
+        json_response(['data' => [
+            'updated' => true,
+            'csrf_token' => $newPassword === '' ? null : $_SESSION['csrf_token'],
+        ]]);
     }
 
     if ($route === '/profile/avatar' && $method === 'POST') {
@@ -355,7 +458,7 @@ try {
         );
         $statement->execute(['user_id' => (int) $user['id'], 'avatar_path' => $avatarPath]);
         record_user_action((int) $user['id'], $orgId, 'profile.avatar_updated', 'user', (int) $user['id']);
-        json_response(['data' => ['avatar_path' => app_url($avatarPath)]]);
+        json_response(['data' => ['avatar_path' => app_url('profile-image.php')]]);
     }
 
     if (str_starts_with($route, '/admin/')) {
@@ -368,9 +471,11 @@ try {
             'SELECT
                (SELECT COUNT(*) FROM organizations WHERE status = "pending") AS pending_workspaces,
                (SELECT COUNT(*) FROM organizations WHERE status = "active") AS active_workspaces,
-               (SELECT COUNT(*) FROM users WHERE status = "active") AS active_users,
+               (SELECT COUNT(*) FROM users u JOIN organizations o ON o.id = u.organization_id
+                 WHERE u.status = "active" AND o.status = "active") AS active_users,
                (SELECT COUNT(*) FROM news_articles WHERE status = "Published") AS published_articles,
-               (SELECT COUNT(*) FROM news_comments WHERE status = "Pending") AS pending_comments'
+               (SELECT COUNT(*) FROM news_comments WHERE status = "Pending") AS pending_comments,
+               (SELECT COUNT(*) FROM news_subscribers WHERE status = "Active") AS active_subscribers'
         )->fetch();
         json_response(['data' => ['counts' => $counts]]);
     }
@@ -384,10 +489,13 @@ try {
         $count = db()->prepare('SELECT COUNT(*) FROM organizations WHERE status = :status');
         $count->execute(['status' => $status]);
         $total = (int) $count->fetchColumn();
+        $pages = max(1, (int) ceil($total / 20));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT o.id, o.name, o.country, o.status, o.created_at,
                     u.id AS creator_id, u.full_name AS creator_name, u.email AS creator_email
-             FROM organizations o JOIN users u ON u.organization_id = o.id AND u.role = "admin"
+             FROM organizations o JOIN users u ON u.organization_id = o.id
+                   AND u.id = (SELECT MIN(u2.id) FROM users u2 WHERE u2.organization_id = o.id)
              WHERE o.status = :status
              ORDER BY o.created_at DESC, o.id DESC LIMIT :limit OFFSET :offset'
         );
@@ -397,7 +505,7 @@ try {
         $statement->execute();
         json_response(['data' => [
             'workspaces' => $statement->fetchAll(),
-            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => max(1, (int) ceil($total / 20))],
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => $pages],
         ]]);
     }
 
@@ -416,13 +524,21 @@ try {
         if ($statement->rowCount() !== 1) {
             throw new ApiException(409, 'This workspace request is no longer pending.');
         }
-        record_user_action((int) $user['id'], null, 'workspace.' . $decision . 'd', 'organization', (int) $matches[1]);
+        record_user_action(
+            (int) $user['id'],
+            (int) $matches[1],
+            $decision === 'approve' ? 'workspace.approved' : 'workspace.rejected',
+            'organization',
+            (int) $matches[1]
+        );
         json_response(['data' => ['status' => $status]]);
     }
 
     if ($route === '/admin/logs' && $method === 'GET') {
         $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
         $count = (int) db()->query('SELECT COUNT(*) FROM user_action_logs')->fetchColumn();
+        $pages = max(1, (int) ceil($count / 50));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT l.id, l.action, l.target_type, l.target_id, l.details_json, l.created_at,
                     u.full_name AS actor_name, u.email AS actor_email,
@@ -443,7 +559,7 @@ try {
         unset($log);
         json_response(['data' => [
             'logs' => $logs,
-            'pagination' => ['page' => $page, 'per_page' => 50, 'total' => $count, 'pages' => max(1, (int) ceil($count / 50))],
+            'pagination' => ['page' => $page, 'per_page' => 50, 'total' => $count, 'pages' => $pages],
         ]]);
     }
 
@@ -456,6 +572,8 @@ try {
         $count = db()->prepare('SELECT COUNT(*) FROM news_comments WHERE status = :status');
         $count->execute(['status' => $status]);
         $total = (int) $count->fetchColumn();
+        $pages = max(1, (int) ceil($total / 20));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT c.id, c.display_name, c.email, c.body_text, c.status, c.created_at,
                     a.title AS article_title, a.slug
@@ -469,8 +587,56 @@ try {
         $statement->execute();
         json_response(['data' => [
             'comments' => $statement->fetchAll(),
-            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => max(1, (int) ceil($total / 20))],
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => $pages],
         ]]);
+    }
+
+    if ($route === '/admin/subscribers' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $status = (string) ($_GET['status'] ?? 'Active');
+        if (!in_array($status, ['Active', 'Unsubscribed'], true)) {
+            throw new ApiException(422, 'Choose a valid subscriber status.');
+        }
+        $count = db()->prepare('SELECT COUNT(*) FROM news_subscribers WHERE status = :status');
+        $count->execute(['status' => $status]);
+        $total = (int) $count->fetchColumn();
+        $limit = 20;
+        $pages = max(1, (int) ceil($total / $limit));
+        $page = min($page, $pages);
+        $statement = db()->prepare(
+            'SELECT id, email, name, status, consent_at, unsubscribed_at, created_at
+             FROM news_subscribers
+             WHERE status = :status
+             ORDER BY created_at DESC, id DESC
+             LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':status', $status);
+        $statement->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * $limit, PDO::PARAM_INT);
+        $statement->execute();
+        json_response(['data' => [
+            'subscribers' => $statement->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => $pages],
+        ]]);
+    }
+
+    if (preg_match('#^/admin/subscribers/([1-9][0-9]*)/unsubscribe$#', $route, $matches) === 1 && $method === 'POST') {
+        $statement = db()->prepare(
+            'UPDATE news_subscribers
+             SET status = "Unsubscribed", unsubscribed_at = UTC_TIMESTAMP()
+             WHERE id = :id AND status = "Active"'
+        );
+        $statement->execute(['id' => (int) $matches[1]]);
+        if ($statement->rowCount() !== 1) {
+            $check = db()->prepare('SELECT id FROM news_subscribers WHERE id = :id');
+            $check->execute(['id' => (int) $matches[1]]);
+            if ($check->fetchColumn() === false) {
+                throw new ApiException(404, 'Subscriber not found.');
+            }
+            throw new ApiException(409, 'This subscriber is already unsubscribed.');
+        }
+        record_user_action((int) $user['id'], null, 'newsletter.unsubscribed_by_admin', 'newsletter_subscriber', (int) $matches[1]);
+        json_response(['data' => ['unsubscribed' => true]]);
     }
 
     if (preg_match('#^/admin/comments/([1-9][0-9]*)/decision$#', $route, $matches) === 1 && $method === 'POST') {
@@ -503,6 +669,8 @@ try {
     if ($route === '/admin/news' && $method === 'GET') {
         $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
         $count = (int) db()->query('SELECT COUNT(*) FROM news_articles')->fetchColumn();
+        $pages = max(1, (int) ceil($count / 20));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT n.id, n.slug, n.title, n.summary, n.status, n.featured_image_path,
                     n.created_at, n.published_at, u.full_name AS author_name
@@ -514,14 +682,14 @@ try {
         $statement->execute();
         json_response(['data' => [
             'articles' => $statement->fetchAll(),
-            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $count, 'pages' => max(1, (int) ceil($count / 20))],
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $count, 'pages' => $pages],
         ]]);
     }
 
     if ($route === '/admin/news-image' && $method === 'POST') {
         $path = store_news_featured_image($_FILES['image'] ?? []);
         record_user_action((int) $user['id'], null, 'news.image_uploaded', 'news_article');
-        json_response(['data' => ['featured_image_path' => app_url($path)]], 201);
+        json_response(['data' => ['featured_image_path' => $path]], 201);
     }
 
     if ($route === '/admin/news' && $method === 'POST') {
@@ -727,6 +895,12 @@ try {
                     a.authorization_confirmed, a.authorized_at, a.created_at,
                     latest_scan.id AS latest_scan_id,
                     latest_scan.completed_at AS latest_scan_at,
+                    latest_job.id AS latest_job_id,
+                    latest_job.status AS latest_job_status,
+                    scan_schedule.frequency AS scan_schedule_frequency,
+                    scan_schedule.status AS scan_schedule_status,
+                    scan_schedule.expires_at AS scan_schedule_expires_at,
+                    scan_schedule.next_run_at AS scan_schedule_next_run_at,
                     CASE
                       WHEN SUM(f.status <> "Resolved" AND f.severity = "Critical") > 0 THEN "Critical"
                       WHEN SUM(f.status <> "Resolved" AND f.severity = "High") > 0 THEN "High"
@@ -744,8 +918,20 @@ try {
                          AND scan_index.asset_id = a.id
              LEFT JOIN web_scans latest_scan ON latest_scan.id = scan_index.latest_id
                                              AND latest_scan.organization_id = a.organization_id
+             LEFT JOIN (
+                SELECT organization_id, asset_id, MAX(id) AS latest_id
+                FROM scan_jobs
+                GROUP BY organization_id, asset_id
+             ) job_index ON job_index.organization_id = a.organization_id
+                         AND job_index.asset_id = a.id
+             LEFT JOIN scan_jobs latest_job ON latest_job.id = job_index.latest_id
+                                            AND latest_job.organization_id = a.organization_id
+             LEFT JOIN scan_schedules scan_schedule ON scan_schedule.organization_id = a.organization_id
+                                                   AND scan_schedule.asset_id = a.id
              WHERE a.organization_id = :organization_id
-             GROUP BY a.id, latest_scan.id, latest_scan.completed_at
+             GROUP BY a.id, latest_scan.id, latest_scan.completed_at, latest_job.id, latest_job.status,
+                      scan_schedule.frequency, scan_schedule.status, scan_schedule.expires_at,
+                      scan_schedule.next_run_at
              ORDER BY a.created_at DESC'
         );
         $statement->execute(['organization_id' => $orgId]);
@@ -929,6 +1115,12 @@ try {
     }
 
     if ($route === '/assessments/guided' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $total = db()->prepare('SELECT COUNT(*) FROM guided_assessments WHERE organization_id = :organization_id');
+        $total->execute(['organization_id' => $orgId]);
+        $assessmentCount = (int) $total->fetchColumn();
+        $pages = max(1, (int) ceil($assessmentCount / 20));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT ga.id, ga.asset_id, ga.engagement_id, ga.title, ga.scope, ga.frameworks_json, ga.status,
                     ga.overall_score, ga.created_at, ga.updated_at, ga.completed_at,
@@ -946,9 +1138,12 @@ try {
                    AND gaa.guided_assessment_id = ga.id
              WHERE ga.organization_id = :organization_id
              GROUP BY ga.id, a.name, e.title
-             ORDER BY ga.updated_at DESC, ga.id DESC LIMIT 50'
+             ORDER BY ga.updated_at DESC, ga.id DESC LIMIT :limit OFFSET :offset'
         );
-        $statement->execute(['organization_id' => $orgId]);
+        $statement->bindValue(':organization_id', $orgId, PDO::PARAM_INT);
+        $statement->bindValue(':limit', 20, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * 20, PDO::PARAM_INT);
+        $statement->execute();
         $assessments = $statement->fetchAll();
         foreach ($assessments as &$assessment) {
             $assessment['id'] = (int) $assessment['id'];
@@ -965,7 +1160,10 @@ try {
             unset($assessment['frameworks_json']);
         }
         unset($assessment);
-        json_response(['data' => ['assessments' => $assessments]]);
+        json_response(['data' => [
+            'assessments' => $assessments,
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $assessmentCount, 'pages' => $pages],
+        ]]);
     }
 
     if ($route === '/assessments/guided' && $method === 'POST') {
@@ -1044,6 +1242,7 @@ try {
                 'created_by' => (int) $user['id'],
             ]);
             $assessmentId = (int) $pdo->lastInsertId();
+            record_user_action((int) $user['id'], $orgId, 'guided_assessment.created', 'guided_assessment', $assessmentId);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1073,6 +1272,7 @@ try {
             }
             throw new ApiException(409, 'Only draft assessments can be cancelled.');
         }
+        record_user_action((int) $user['id'], $orgId, 'guided_assessment.cancelled', 'guided_assessment', (int) $matches[1]);
         json_response(['data' => ['cancelled' => true]]);
     }
 
@@ -1164,6 +1364,9 @@ try {
         $pdo->beginTransaction();
         try {
             save_guided_assessment_answers((int) $matches[1], $orgId, $answers);
+            record_user_action((int) $user['id'], $orgId, 'guided_assessment.answers_saved', 'guided_assessment', (int) $matches[1], [
+                'answer_count' => count($answers),
+            ]);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1364,6 +1567,11 @@ try {
                 'id' => (int) $assessment['id'],
                 'organization_id' => $orgId,
             ]);
+            record_user_action((int) $user['id'], $orgId, 'guided_assessment.completed', 'guided_assessment', (int) $assessment['id'], [
+                'assessment_id' => $baseAssessmentId,
+                'findings_created' => $findingsCreated,
+                'risk_level' => $riskLevel,
+            ]);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1379,6 +1587,156 @@ try {
             'findings_created' => $findingsCreated,
             'summary' => $assessmentSummary,
         ]]);
+    }
+
+    if (preg_match('#^/assets/([1-9][0-9]*)/scan-schedule$#', $route, $matches) === 1 && $method === 'GET') {
+        $assetId = (int) $matches[1];
+        $assetQuery = db()->prepare(
+            'SELECT id FROM assets WHERE id = :id AND organization_id = :organization_id LIMIT 1'
+        );
+        $assetQuery->execute(['id' => $assetId, 'organization_id' => $orgId]);
+        if ($assetQuery->fetchColumn() === false) {
+            throw new ApiException(404, 'Asset not found.');
+        }
+        $statement = db()->prepare(
+            'SELECT id, frequency, status, next_run_at, expires_at, authorization_confirmed_at
+             FROM scan_schedules WHERE asset_id = :asset_id AND organization_id = :organization_id LIMIT 1'
+        );
+        $statement->execute(['asset_id' => $assetId, 'organization_id' => $orgId]);
+        json_response(['data' => ['schedule' => $statement->fetch() ?: null]]);
+    }
+
+    if (preg_match('#^/assets/([1-9][0-9]*)/scan-schedule$#', $route, $matches) === 1 && $method === 'PUT') {
+        require_write_role($user);
+        $input = request_json();
+        if (($input['authorization_confirmed'] ?? false) !== true) {
+            throw new ApiException(422, 'Confirm that your organisation authorises recurring safe reviews through the selected end date.');
+        }
+        $frequency = required_string($input, 'frequency', 12, 'Frequency');
+        if (!in_array($frequency, ['daily', 'weekly'], true)) {
+            throw new ApiException(422, 'Choose a daily or weekly review frequency.');
+        }
+        $endDate = required_string($input, 'authorized_until', 10, 'Authorised end date');
+        $end = DateTimeImmutable::createFromFormat('!Y-m-d', $endDate, new DateTimeZone('UTC'));
+        $dateErrors = DateTimeImmutable::getLastErrors();
+        $today = new DateTimeImmutable('today', new DateTimeZone('UTC'));
+        if ($end === false
+            || ($dateErrors !== false && ($dateErrors['warning_count'] > 0 || $dateErrors['error_count'] > 0))
+            || $end->format('Y-m-d') !== $endDate
+            || $end < $today->modify($frequency === 'weekly' ? '+7 days' : '+1 day')
+            || $end > $today->modify('+90 days')
+        ) {
+            $minimumDays = $frequency === 'weekly' ? 7 : 1;
+            throw new ApiException(422, 'Choose an authorisation end date at least ' . $minimumDays . ' day(s) from today and no more than 90 days away.');
+        }
+
+        $assetId = (int) $matches[1];
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $assetQuery = $pdo->prepare(
+                'SELECT id, type, status, authorization_confirmed FROM assets
+                 WHERE id = :id AND organization_id = :organization_id LIMIT 1 FOR UPDATE'
+            );
+            $assetQuery->execute(['id' => $assetId, 'organization_id' => $orgId]);
+            $asset = $assetQuery->fetch();
+            if ($asset === false) {
+                throw new ApiException(404, 'Asset not found.');
+            }
+            if (!in_array($asset['type'], ['Website', 'API'], true) || $asset['status'] === 'Archived') {
+                throw new ApiException(422, 'Schedules are available only for active Website and API assets.');
+            }
+            if ((int) $asset['authorization_confirmed'] !== 1) {
+                throw new ApiException(403, 'Confirm ownership or explicit permission before scheduling reviews.');
+            }
+
+            $nextInterval = $frequency === 'daily' ? '1 DAY' : '7 DAY';
+            $statement = $pdo->prepare(
+                'INSERT INTO scan_schedules
+                    (organization_id, asset_id, created_by, frequency, status, next_run_at,
+                     expires_at, authorization_confirmed_at)
+                 VALUES
+                    (:organization_id, :asset_id, :created_by, :frequency, "Active",
+                     DATE_ADD(UTC_TIMESTAMP(), INTERVAL ' . $nextInterval . '),
+                     CONCAT(:expires_date, " 23:59:59"), UTC_TIMESTAMP())
+                 ON DUPLICATE KEY UPDATE
+                    created_by = VALUES(created_by),
+                    frequency = VALUES(frequency),
+                    status = "Active",
+                    next_run_at = VALUES(next_run_at),
+                    expires_at = VALUES(expires_at),
+                    authorization_confirmed_at = UTC_TIMESTAMP()'
+            );
+            $statement->execute([
+                'organization_id' => $orgId,
+                'asset_id' => $assetId,
+                'created_by' => (int) $user['id'],
+                'frequency' => $frequency,
+                'expires_date' => $endDate,
+            ]);
+            record_user_action((int) $user['id'], $orgId, 'asset.scan_schedule_created', 'asset', $assetId, [
+                'frequency' => $frequency,
+                'authorized_until' => $endDate,
+            ]);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['saved' => true]], 201);
+    }
+
+    if (preg_match('#^/assets/([1-9][0-9]*)/scan-schedule$#', $route, $matches) === 1 && $method === 'DELETE') {
+        require_write_role($user);
+        $assetId = (int) $matches[1];
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $scheduleQuery = $pdo->prepare(
+                'SELECT id FROM scan_schedules
+                 WHERE asset_id = :asset_id AND organization_id = :organization_id FOR UPDATE'
+            );
+            $scheduleQuery->execute(['asset_id' => $assetId, 'organization_id' => $orgId]);
+            $scheduleId = $scheduleQuery->fetchColumn();
+            if ($scheduleId === false) {
+                throw new ApiException(404, 'Review schedule not found.');
+            }
+            $pdo->prepare('UPDATE scan_schedules SET status = "Paused" WHERE id = :id')
+                ->execute(['id' => (int) $scheduleId]);
+            $pdo->prepare(
+                'UPDATE scan_jobs SET status = "Cancelled", completed_at = UTC_TIMESTAMP()
+                 WHERE schedule_id = :schedule_id AND status = "Queued"'
+            )->execute(['schedule_id' => (int) $scheduleId]);
+            record_user_action((int) $user['id'], $orgId, 'asset.scan_schedule_paused', 'asset', $assetId);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['paused' => true]]);
+    }
+
+    if (preg_match('#^/assets/([1-9][0-9]*)/scan-jobs/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'GET') {
+        $statement = db()->prepare(
+            'SELECT id, status, attempts, requested_at, started_at, completed_at, error_message
+             FROM scan_jobs
+             WHERE id = :id AND asset_id = :asset_id AND organization_id = :organization_id
+             LIMIT 1'
+        );
+        $statement->execute([
+            'id' => (int) $matches[2],
+            'asset_id' => (int) $matches[1],
+            'organization_id' => $orgId,
+        ]);
+        $job = $statement->fetch();
+        if ($job === false) {
+            throw new ApiException(404, 'Review job not found.');
+        }
+        json_response(['data' => ['job' => $job]]);
     }
 
     if (preg_match('#^/assets/([1-9][0-9]*)/scan$#', $route, $matches) === 1 && $method === 'GET') {
@@ -1464,6 +1822,18 @@ try {
             );
             $limitQuery->execute(['organization_id' => $orgId, 'asset_id' => (int) $asset['id']]);
             $limit = $limitQuery->fetch();
+            $pendingQuery = $pdo->prepare(
+                'SELECT id, status FROM scan_jobs
+                 WHERE organization_id = :organization_id AND asset_id = :asset_id
+                   AND status IN ("Queued", "Running")
+                 ORDER BY id DESC LIMIT 1'
+            );
+            $pendingQuery->execute(['organization_id' => $orgId, 'asset_id' => (int) $asset['id']]);
+            $pendingJob = $pendingQuery->fetch();
+            if ($pendingJob !== false) {
+                $pdo->commit();
+                json_response(['data' => ['job' => $pendingJob]], 202);
+            }
             if ((int) $limit['is_limited'] === 1) {
                 $pdo->commit();
                 throw new ApiException(429, 'Please wait one minute between reviews of the same asset.');
@@ -1472,6 +1842,16 @@ try {
                 'UPDATE asset_scan_limits SET last_requested_at = UTC_TIMESTAMP()
                  WHERE organization_id = :organization_id AND asset_id = :asset_id'
             )->execute(['organization_id' => $orgId, 'asset_id' => (int) $asset['id']]);
+            record_user_action((int) $user['id'], $orgId, 'asset.safe_review_requested', 'asset', (int) $asset['id']);
+            $pdo->prepare(
+                'INSERT INTO scan_jobs (organization_id, asset_id, requested_by)
+                 VALUES (:organization_id, :asset_id, :requested_by)'
+            )->execute([
+                'organization_id' => $orgId,
+                'asset_id' => (int) $asset['id'],
+                'requested_by' => (int) $user['id'],
+            ]);
+            $jobId = (int) $pdo->lastInsertId();
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1479,109 +1859,7 @@ try {
             }
             throw $exception;
         }
-
-        $review = run_safe_asset_review($asset['target'], $asset['type']);
-        $pdo->beginTransaction();
-        try {
-            $statement = $pdo->prepare(
-                'INSERT INTO assessments
-                    (organization_id, asset_id, assessor_id, assessment_type, summary, risk_score)
-                 VALUES
-                    (:organization_id, :asset_id, :assessor_id, "safe_web_review", :summary, :risk_score)'
-            );
-            $statement->execute([
-                'organization_id' => $orgId,
-                'asset_id' => (int) $asset['id'],
-                'assessor_id' => (int) $user['id'],
-                'summary' => $review['summary'],
-                'risk_score' => $review['risk_score'],
-            ]);
-            $assessmentId = (int) $pdo->lastInsertId();
-            $pdo->prepare(
-                'UPDATE findings f
-                 JOIN assessments previous ON previous.organization_id = f.organization_id
-                                           AND previous.id = f.assessment_id
-                 SET f.status = "Resolved", f.resolved_at = UTC_TIMESTAMP()
-                 WHERE f.organization_id = :organization_id
-                   AND f.asset_id = :asset_id
-                   AND previous.assessment_type = "safe_web_review"
-                   AND f.status <> "Resolved"'
-            )->execute([
-                'organization_id' => $orgId,
-                'asset_id' => (int) $asset['id'],
-            ]);
-            $generatedFindings = 0;
-            $findingInsert = $pdo->prepare(
-                'INSERT INTO findings
-                    (organization_id, asset_id, assessment_id, title, description,
-                     evidence, recommendation, severity, created_by)
-                 VALUES
-                    (:organization_id, :asset_id, :assessment_id, :title, :description,
-                     :evidence, :recommendation, :severity, :created_by)'
-            );
-            foreach ($review['checks'] as $check) {
-                if ($check['status'] !== 'fail') {
-                    continue;
-                }
-                $findingInsert->execute([
-                    'organization_id' => $orgId,
-                    'asset_id' => (int) $asset['id'],
-                    'assessment_id' => $assessmentId,
-                    'title' => $asset['type'] . ' review: ' . $check['title'],
-                    'description' => $check['evidence'],
-                    'evidence' => $check['evidence'],
-                    'recommendation' => $check['recommendation'],
-                    'severity' => $check['severity'],
-                    'created_by' => (int) $user['id'],
-                ]);
-                $generatedFindings++;
-            }
-            $statement = $pdo->prepare(
-                'INSERT INTO web_scans
-                    (organization_id, asset_id, assessment_id, scanner_id, checks_json)
-                 VALUES
-                    (:organization_id, :asset_id, :assessment_id, :scanner_id, :checks_json)'
-            );
-            $statement->execute([
-                'organization_id' => $orgId,
-                'asset_id' => (int) $asset['id'],
-                'assessment_id' => $assessmentId,
-                'scanner_id' => (int) $user['id'],
-                'checks_json' => json_encode($review['checks'], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
-            ]);
-            $pdo->prepare(
-                'UPDATE assets SET risk_level = :risk_level
-                 WHERE id = :id AND organization_id = :organization_id'
-            )->execute([
-                'risk_level' => $review['risk_level'],
-                'id' => (int) $asset['id'],
-                'organization_id' => $orgId,
-            ]);
-            $scanId = (int) $pdo->lastInsertId();
-            $completedAtQuery = $pdo->prepare(
-                'SELECT completed_at FROM web_scans
-                 WHERE id = :id AND organization_id = :organization_id'
-            );
-            $completedAtQuery->execute(['id' => $scanId, 'organization_id' => $orgId]);
-            $completedAt = $completedAtQuery->fetchColumn();
-            $pdo->commit();
-        } catch (Throwable $exception) {
-            if ($pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
-            throw $exception;
-        }
-        json_response(['data' => [
-            'scan' => [
-                'id' => $scanId,
-                'completed_at' => $completedAt,
-                'risk_score' => $review['risk_score'],
-                'risk_level' => $review['risk_level'],
-                'summary' => $review['summary'],
-                'findings_created' => $generatedFindings,
-                'checks' => $review['checks'],
-            ],
-        ]], 201);
+        json_response(['data' => ['job' => ['id' => $jobId, 'status' => 'Queued']]], 202);
     }
 
     if ($route === '/assets' && $method === 'POST') {
@@ -1636,7 +1914,9 @@ try {
             'authorization_note' => $authorizationNote,
             'authorized_by' => (int) $user['id'],
         ]);
-        json_response(['data' => ['id' => (int) db()->lastInsertId()]], 201);
+        $assetId = (int) db()->lastInsertId();
+        record_user_action((int) $user['id'], $orgId, 'asset.created', 'asset', $assetId, ['type' => $type]);
+        json_response(['data' => ['id' => $assetId]], 201);
     }
 
     if (preg_match('#^/assets/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'PATCH') {
@@ -1664,6 +1944,9 @@ try {
                 throw new ApiException(404, 'Asset not found.');
             }
         }
+        record_user_action((int) $user['id'], $orgId, 'asset.status_updated', 'asset', (int) $matches[1], [
+            'status' => $status,
+        ]);
         json_response(['data' => ['updated' => true]]);
     }
 
@@ -1688,6 +1971,7 @@ try {
             $pdo->prepare(
                 'DELETE FROM assets WHERE id = :id AND organization_id = :organization_id'
             )->execute(['id' => $assetId, 'organization_id' => $orgId]);
+            record_user_action((int) $user['id'], $orgId, 'asset.deleted', 'asset', $assetId);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1750,6 +2034,10 @@ try {
                 'id' => $assetId,
                 'organization_id' => $orgId,
             ]);
+            record_user_action((int) $user['id'], $orgId, 'assessment.created', 'assessment', $assessmentId, [
+                'asset_id' => (int) $assetId,
+                'risk_level' => $riskLevel,
+            ]);
             $pdo->commit();
         } catch (Throwable $exception) {
             if ($pdo->inTransaction()) {
@@ -1803,7 +2091,12 @@ try {
             'severity' => $severity,
             'created_by' => (int) $user['id'],
         ]);
-        json_response(['data' => ['id' => (int) $pdo->lastInsertId()]], 201);
+        $findingId = (int) $pdo->lastInsertId();
+        record_user_action((int) $user['id'], $orgId, 'finding.created', 'finding', $findingId, [
+            'asset_id' => (int) $assetId,
+            'severity' => $severity,
+        ]);
+        json_response(['data' => ['id' => $findingId]], 201);
     }
 
     if ($route === '/findings' && $method === 'GET') {
@@ -1814,23 +2107,73 @@ try {
                 throw new ApiException(422, 'Choose a valid asset.');
             }
         }
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $statusFilter = (string) ($_GET['status'] ?? '');
+        if (!in_array($statusFilter, ['', 'Open', 'In progress', 'Resolved'], true)) {
+            throw new ApiException(422, 'Choose a valid finding status.');
+        }
         $assetCondition = $assetId === null ? '' : ' AND f.asset_id = :asset_id';
+        $statusCondition = $statusFilter === '' ? '' : ' AND f.status = :status';
+        $countQuery = db()->prepare(
+            'SELECT COUNT(*) AS total,
+                    SUM(f.status = "Open") AS open_count,
+                    SUM(f.status = "In progress") AS progress_count,
+                    SUM(f.status = "Resolved") AS resolved_count
+             FROM findings f WHERE f.organization_id = :organization_id' . $assetCondition
+        );
+        $countParameters = ['organization_id' => $orgId];
+        if ($assetId !== null) {
+            $countParameters['asset_id'] = (int) $assetId;
+        }
+        $countQuery->execute($countParameters);
+        $counts = $countQuery->fetch();
+        $totalQuery = db()->prepare(
+            'SELECT COUNT(*) FROM findings f
+             WHERE f.organization_id = :organization_id' . $assetCondition . $statusCondition
+        );
+        $filteredParameters = $countParameters;
+        if ($statusFilter !== '') {
+            $filteredParameters['status'] = $statusFilter;
+        }
+        $totalQuery->execute($filteredParameters);
+        $filteredTotal = (int) $totalQuery->fetchColumn();
+        $limit = 20;
+        $pages = max(1, (int) ceil($filteredTotal / $limit));
+        $page = min($page, $pages);
         $statement = db()->prepare(
             'SELECT f.id, f.asset_id, f.title, f.description, f.evidence, f.recommendation, f.severity,
                     f.status, f.created_at, f.updated_at, a.name AS asset_name
              FROM findings f JOIN assets a ON a.id = f.asset_id AND a.organization_id = f.organization_id
              WHERE f.organization_id = :organization_id
              ' . $assetCondition . '
+             ' . $statusCondition . '
              ORDER BY FIELD(f.status, "Open", "In progress", "Resolved"),
                       FIELD(f.severity, "Critical", "High", "Medium", "Low"),
-                      f.created_at DESC LIMIT 100'
+                      f.created_at DESC LIMIT :limit OFFSET :offset'
         );
         $parameters = ['organization_id' => $orgId];
         if ($assetId !== null) {
             $parameters['asset_id'] = (int) $assetId;
         }
-        $statement->execute($parameters);
-        json_response(['data' => ['findings' => $statement->fetchAll()]]);
+        if ($statusFilter !== '') {
+            $parameters['status'] = $statusFilter;
+        }
+        foreach ($parameters as $key => $value) {
+            $statement->bindValue(':' . $key, $value, $key === 'status' ? PDO::PARAM_STR : PDO::PARAM_INT);
+        }
+        $statement->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * $limit, PDO::PARAM_INT);
+        $statement->execute();
+        json_response(['data' => [
+            'findings' => $statement->fetchAll(),
+            'summary' => [
+                'total' => (int) $counts['total'],
+                'open' => (int) $counts['open_count'],
+                'in_progress' => (int) $counts['progress_count'],
+                'resolved' => (int) $counts['resolved_count'],
+            ],
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $filteredTotal, 'pages' => $pages],
+        ]]);
     }
 
     if (preg_match('#^/findings/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'PATCH') {
@@ -1860,7 +2203,37 @@ try {
                 throw new ApiException(404, 'Finding not found.');
             }
         }
+        record_user_action((int) $user['id'], $orgId, 'finding.status_updated', 'finding', (int) $matches[1], ['status' => $status]);
         json_response(['data' => ['updated' => true]]);
+    }
+
+    if (preg_match('#^/findings/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'DELETE') {
+        require_write_role($user);
+        $pdo = db();
+        $findingId = (int) $matches[1];
+        $pdo->beginTransaction();
+        try {
+            $findingQuery = $pdo->prepare(
+                'SELECT id FROM findings
+                 WHERE id = :id AND organization_id = :organization_id
+                 FOR UPDATE'
+            );
+            $findingQuery->execute(['id' => $findingId, 'organization_id' => $orgId]);
+            if ($findingQuery->fetchColumn() === false) {
+                throw new ApiException(404, 'Finding not found.');
+            }
+            $pdo->prepare(
+                'DELETE FROM findings WHERE id = :id AND organization_id = :organization_id'
+            )->execute(['id' => $findingId, 'organization_id' => $orgId]);
+            record_user_action((int) $user['id'], $orgId, 'finding.deleted', 'finding', $findingId);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['deleted' => true]]);
     }
 
     throw new ApiException(404, 'API endpoint not found.');
