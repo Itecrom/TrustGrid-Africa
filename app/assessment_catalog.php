@@ -364,8 +364,31 @@ function assessment_controls_for_asset_type(string $assetType): array
 function save_guided_assessment_answers(int $assessmentId, int $organizationId, array $answers): void
 {
     $pdo = db();
+    $engagementLinkQuery = $pdo->prepare(
+        'SELECT engagement_id FROM guided_assessments
+         WHERE id = :id AND organization_id = :organization_id'
+    );
+    $engagementLinkQuery->execute(['id' => $assessmentId, 'organization_id' => $organizationId]);
+    $engagementId = $engagementLinkQuery->fetchColumn();
+    if ($engagementId === false) {
+        throw new ApiException(404, 'Assessment not found.');
+    }
+    if ($engagementId !== null) {
+        $engagementQuery = $pdo->prepare(
+            'SELECT (start_date <= UTC_DATE() AND end_date >= UTC_DATE()
+                     AND status IN ("Planned", "Active")) AS is_active
+             FROM assessment_engagements
+             WHERE id = :id AND organization_id = :organization_id
+             FOR UPDATE'
+        );
+        $engagementQuery->execute(['id' => (int) $engagementId, 'organization_id' => $organizationId]);
+        $engagement = $engagementQuery->fetch();
+        if ($engagement === false || (int) $engagement['is_active'] !== 1) {
+            throw new ApiException(409, 'This engagement is outside its authorised date window or has been closed. Do not record further assessment responses.');
+        }
+    }
     $assessmentQuery = $pdo->prepare(
-        'SELECT ga.id, ga.frameworks_json, ga.status, a.type AS asset_type
+        'SELECT ga.id, ga.frameworks_json, ga.status, ga.engagement_id, a.type AS asset_type
          FROM guided_assessments ga
          JOIN assets a ON a.id = ga.asset_id AND a.organization_id = ga.organization_id
          WHERE ga.id = :id AND ga.organization_id = :organization_id
@@ -377,9 +400,10 @@ function save_guided_assessment_answers(int $assessmentId, int $organizationId, 
         throw new ApiException(404, 'Assessment not found.');
     }
     if ($assessment['status'] !== 'Draft') {
-        throw new ApiException(409, 'Completed assessments are read-only.');
+        throw new ApiException(409, $assessment['status'] === 'Cancelled'
+            ? 'Cancelled assessments are read-only.'
+            : 'Completed assessments are read-only.');
     }
-
     $frameworks = json_decode($assessment['frameworks_json'], true, 16, JSON_THROW_ON_ERROR);
     $controls = array_values(array_filter(
         assessment_controls_for_asset_type($assessment['asset_type']),

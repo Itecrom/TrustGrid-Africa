@@ -449,22 +449,21 @@
 
   const loadAssetOptions = async () => {
     const assets = (await request('/api/assets')).assets;
-    const select = document.querySelector('[name="asset_id"]');
-    if (select) {
+    const query = new URLSearchParams(window.location.search);
+    document.querySelectorAll('form [name="asset_id"]').forEach((select) => {
       const currentValue = select.value;
       select.replaceChildren(new Option('Choose an authorised asset', ''));
       assets.filter((asset) => asset.status !== 'Archived').forEach((asset) => {
         select.add(new Option(`${asset.name} · ${asset.target}`, asset.id));
       });
-      const requestedAssetId = new URLSearchParams(window.location.search).get('asset_id');
       if (currentValue) {
         select.value = currentValue;
-      } else if (requestedAssetId && assets.some((asset) => String(asset.id) === requestedAssetId)) {
-        select.value = requestedAssetId;
+      } else if (query.get('asset_id') && assets.some((asset) => String(asset.id) === query.get('asset_id'))) {
+        select.value = query.get('asset_id');
       }
-    }
+    });
     const guidedForm = document.getElementById('guidedAssessmentForm');
-    const query = new URLSearchParams(window.location.search);
+    const select = guidedForm?.querySelector('[name="asset_id"]');
     if (guidedForm && select) {
       const updateFrameworkOptions = (selected = []) => {
         const selectedAsset = assets.find((asset) => String(asset.id) === select.value);
@@ -506,6 +505,7 @@
       assets.forEach((asset) => findingsFilter.add(new Option(asset.name, asset.id)));
       findingsFilter.value = selectedFindingsAssetId;
     }
+    renderEngagementOptions();
   };
 
   const bindAssessmentForm = () => {
@@ -571,6 +571,7 @@
 
   let assessmentCatalog = null;
   let activeGuidedAssessment = null;
+  let allEngagements = [];
   const assessmentAnswerLabels = {
     implemented: 'Yes, in place',
     partial: 'Partly in place',
@@ -596,6 +597,122 @@
     });
   };
 
+  const renderEngagementOptions = () => {
+    const form = document.getElementById('guidedAssessmentForm');
+    const select = form?.querySelector('[name="engagement_id"]');
+    if (!select) return;
+    const assetId = form.elements.asset_id.value;
+    const previousValue = select.value;
+    select.replaceChildren(new Option('No engagement link', ''));
+    allEngagements
+      .filter((engagement) => engagement.status === 'Active' && String(engagement.asset_id) === assetId)
+      .forEach((engagement) => {
+        select.add(new Option(`${engagement.title} · ${engagement.start_date} to ${engagement.end_date}`, engagement.id));
+      });
+    if ([...select.options].some((option) => option.value === previousValue)) {
+      select.value = previousValue;
+    }
+  };
+
+  const renderAssessmentEngagements = () => {
+    const list = document.getElementById('assessmentEngagementList');
+    if (!list) return;
+    list.replaceChildren();
+    if (allEngagements.length === 0) {
+      list.append(make('p', 'empty-state', 'No engagement records yet. Document written permission and scope before beginning work.'));
+      return;
+    }
+    allEngagements.forEach((engagement) => {
+      const card = make('article', 'assessment-engagement-card');
+      const details = make('div', 'assessment-engagement-details');
+      const heading = make('div', 'assessment-engagement-heading');
+      heading.append(make('h3', '', engagement.title), make('span', `tag ${engagement.status === 'Active' ? 'low' : 'unassessed'}`, engagement.status));
+      details.append(
+        heading,
+        make('p', '', `${engagement.asset_name} · ${engagement.start_date} to ${engagement.end_date} · Lead: ${engagement.lead_name}`),
+        make('p', '', `Authorisation: ${engagement.authorization_note} · ${engagement.assessment_count} assessment(s)`)
+      );
+      const disclosure = make('details', 'assessment-engagement-scope');
+      disclosure.append(make('summary', '', 'View authorised scope and rules'));
+      [
+        ['In scope', engagement.scope_text],
+        ['Out of scope', engagement.exclusions],
+        ['Rules of engagement', engagement.rules_of_engagement],
+      ].forEach(([label, value]) => {
+        const paragraph = make('p');
+        paragraph.append(make('strong', '', `${label}: `), document.createTextNode(value));
+        disclosure.append(paragraph);
+      });
+      details.append(disclosure);
+      card.append(details);
+      const actions = make('div', 'assessment-engagement-actions');
+      if (engagement.status === 'Active') {
+        const start = make('button', 'button button-secondary button-small', 'Start assessment');
+        start.type = 'button';
+        start.addEventListener('click', () => {
+          const form = document.getElementById('guidedAssessmentForm');
+          if (!form) return;
+          form.elements.asset_id.value = String(engagement.asset_id);
+          form.elements.asset_id.dispatchEvent(new Event('change', { bubbles: true }));
+          form.elements.title.value = engagement.title;
+          form.elements.scope.value = engagement.scope_text;
+          renderEngagementOptions();
+          form.elements.engagement_id.value = String(engagement.id);
+          form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+        actions.append(start);
+      }
+      if (engagement.status === 'Active') {
+        const close = make('button', 'button button-secondary button-small', 'Close engagement');
+        close.type = 'button';
+        close.addEventListener('click', async () => {
+          if (!window.confirm(`Close "${engagement.title}" and prevent further draft responses under it?`)) return;
+          close.disabled = true;
+          try {
+            await request(`/api/assessments/engagements/${engagement.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: 'Completed' }),
+            });
+            await loadAssessmentEngagements();
+          } catch (error) {
+            message(document.querySelector('#assessmentEngagementForm [data-form-message]'), error.message, true);
+            close.disabled = false;
+          }
+        });
+        actions.append(close);
+      }
+      if (['Active', 'Planned'].includes(engagement.status)) {
+        const cancel = make('button', 'button button-secondary button-small', 'Cancel engagement');
+        cancel.type = 'button';
+        cancel.addEventListener('click', async () => {
+          if (!window.confirm(`Cancel "${engagement.title}"?`)) return;
+          cancel.disabled = true;
+          try {
+            await request(`/api/assessments/engagements/${engagement.id}`, {
+              method: 'PATCH',
+              body: JSON.stringify({ status: 'Cancelled' }),
+            });
+            await loadAssessmentEngagements();
+          } catch (error) {
+            message(document.querySelector('#assessmentEngagementForm [data-form-message]'), error.message, true);
+            cancel.disabled = false;
+          }
+        });
+        actions.append(cancel);
+      }
+      card.append(actions);
+      list.append(card);
+    });
+  };
+
+  const loadAssessmentEngagements = async () => {
+    if (!document.getElementById('assessmentEngagementList')) return;
+    const result = await request('/api/assessments/engagements');
+    allEngagements = result.engagements;
+    renderAssessmentEngagements();
+    renderEngagementOptions();
+  };
+
   const renderGuidedAssessmentList = (assessments) => {
     const list = document.getElementById('guidedAssessmentList');
     if (!list) return;
@@ -609,7 +726,7 @@
       const details = make('div');
       details.append(
         make('h3', '', assessment.title),
-        make('p', '', `${assessment.asset_name} · ${assessment.answered_count} questions answered · ${assessment.frameworks.length} baseline(s)`)
+        make('p', '', `${assessment.asset_name} · ${assessment.answered_count} questions answered · ${assessment.frameworks.length} baseline(s)${assessment.engagement_title ? ` · ${assessment.engagement_title}` : ''}`)
       );
       if (assessment.status === 'Completed') {
         details.append(make('p', 'assessment-history-result', `${assessment.overall_score}% safeguards in place · ${assessment.findings_count} follow-up item(s)`));
@@ -617,7 +734,9 @@
       const action = make(
         'button',
         'button button-secondary button-small',
-        assessment.status === 'Completed' ? 'View report' : 'Continue assessment'
+        assessment.status === 'Completed'
+          ? 'View report'
+          : assessment.status === 'Cancelled' ? 'View cancelled' : 'Continue assessment'
       );
       action.type = 'button';
       action.addEventListener('click', () => openGuidedAssessment(assessment.id));
@@ -659,8 +778,14 @@
     document.getElementById('guidedAssessmentAsset').textContent = assessment.asset_name;
     document.getElementById('guidedAssessmentTitle').textContent = assessment.title;
     document.getElementById('guidedAssessmentScope').textContent = assessment.scope;
+    const engagementInfo = document.getElementById('guidedAssessmentEngagement');
+    if (engagementInfo) {
+      engagementInfo.textContent = assessment.engagement_title
+        ? `Authorised engagement: ${assessment.engagement_title} · ${assessment.engagement_start_date} to ${assessment.engagement_end_date} · Lead: ${assessment.engagement_lead}. In scope: ${assessment.engagement_scope} Out of scope: ${assessment.engagement_exclusions} Rules: ${assessment.rules_of_engagement} Authorisation: ${assessment.engagement_authorization_note}`
+        : 'No engagement is linked. Confirm the organisation’s authorisation and scope before any technical work.';
+    }
     const status = document.getElementById('guidedAssessmentStatus');
-    status.className = `tag ${assessment.status === 'Completed' ? 'low' : 'moderate'}`;
+    status.className = `tag ${assessment.status === 'Completed' ? 'low' : assessment.status === 'Cancelled' ? 'unassessed' : 'moderate'}`;
     status.textContent = assessment.status;
     const frameworkTags = document.getElementById('guidedAssessmentFrameworkTags');
     frameworkTags.replaceChildren();
@@ -669,7 +794,9 @@
       if (framework) frameworkTags.append(make('span', 'tag unassessed', framework.name));
     });
 
-    const readOnly = assessment.status === 'Completed';
+    const completed = assessment.status === 'Completed';
+    const cancelled = assessment.status === 'Cancelled';
+    const readOnly = completed || cancelled;
     const cards = document.getElementById('guidedAssessmentControls');
     cards.replaceChildren();
     let activeArea = '';
@@ -720,9 +847,14 @@
 
     const actions = document.getElementById('guidedAssessmentActions');
     actions.hidden = readOnly;
+    const readOnlyMessage = document.getElementById('guidedAssessmentReadOnlyMessage');
+    if (readOnlyMessage) {
+      readOnlyMessage.hidden = !cancelled;
+      readOnlyMessage.textContent = cancelled ? 'This draft was cancelled and is read-only. No findings were generated.' : '';
+    }
     const results = document.getElementById('guidedAssessmentResults');
-    results.hidden = !readOnly;
-    if (readOnly) {
+    results.hidden = !completed;
+    if (completed) {
       const gaps = assessment.findings || [];
       const pdfLink = document.getElementById('downloadGuidedAssessmentPdf');
       if (pdfLink) {
@@ -789,6 +921,7 @@
         form.reset();
         message(feedback, 'Assessment started. Your progress is saved as you go.');
         await loadGuidedAssessments();
+        await loadAssessmentEngagements();
         await openGuidedAssessment(result.id);
       } catch (error) {
         message(feedback, error.message, true);
@@ -844,11 +977,58 @@
       }
     });
 
+    document.getElementById('cancelGuidedAssessment')?.addEventListener('click', async (event) => {
+      if (!activeGuidedAssessment || activeGuidedAssessment.status !== 'Draft') return;
+      if (!window.confirm('Cancel this draft? Its saved responses will remain read-only, and no findings will be created.')) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await request(`/api/assessments/guided/${activeGuidedAssessment.id}/cancel`, { method: 'POST' });
+        await loadGuidedAssessments();
+        await openGuidedAssessment(activeGuidedAssessment.id);
+      } catch (error) {
+        message(document.getElementById('guidedAssessmentMessage'), error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
+
     document.getElementById('printGuidedAssessment')?.addEventListener('click', () => {
       document.body.classList.add('printing-assessment');
       window.print();
     });
     window.addEventListener('afterprint', () => document.body.classList.remove('printing-assessment'));
+  };
+
+  const bindEngagementForm = () => {
+    const form = document.getElementById('assessmentEngagementForm');
+    if (!form) return;
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('[type="submit"]');
+      const feedback = form.querySelector('[data-form-message]');
+      const data = Object.fromEntries(new FormData(form).entries());
+      data.authorization_confirmed = form.elements.authorization_confirmed.checked;
+      if (data.end_date < data.start_date) {
+        message(feedback, 'The end date must be on or after the start date.', true);
+        return;
+      }
+      button.disabled = true;
+      message(feedback, 'Recording the authorised engagement…');
+      try {
+        await request('/api/assessments/engagements', {
+          method: 'POST',
+          body: JSON.stringify(data),
+        });
+        form.reset();
+        message(feedback, 'Engagement recorded. Keep the written approval available to the team.');
+        await loadAssessmentEngagements();
+      } catch (error) {
+        message(feedback, error.message, true);
+      } finally {
+        button.disabled = false;
+      }
+    });
   };
 
   const loadGuidedAssessments = async () => {
@@ -1009,7 +1189,12 @@
       if (page.dataset.workspacePage === 'dashboard' && dashboard) renderDashboard(dashboard);
       if (page.dataset.workspacePage === 'reports') renderReport(assets, findings);
       await loadAssetOptions();
-      if (page.dataset.workspacePage === 'assessments') await loadGuidedAssessments();
+      if (page.dataset.workspacePage === 'assessments') {
+        await loadGuidedAssessments();
+        await loadAssessmentEngagements();
+        document.querySelector('#guidedAssessmentForm [name="asset_id"]')
+          ?.addEventListener('change', renderEngagementOptions);
+      }
       const findingsAssetFilter = document.getElementById('findingsAssetFilter');
       findingsAssetFilter?.addEventListener('change', () => {
         document.getElementById('findingsList')?.replaceChildren(make('p', 'loading-state', 'Loading findings for this asset…'));
@@ -1043,5 +1228,6 @@
   bindAssessmentForm();
   bindFindingForm();
   bindGuidedAssessment();
+  bindEngagementForm();
   loadWorkspace();
 })();

@@ -13,9 +13,15 @@ if ($assessmentId === false || $assessmentId === null) {
 
 $statement = db()->prepare(
     'SELECT ga.id, ga.title, ga.scope, ga.frameworks_json, ga.status, ga.overall_score, ga.completed_at,
-            a.name AS asset_name, a.type AS asset_type
+            a.name AS asset_name, a.type AS asset_type,
+            e.title AS engagement_title, e.scope_text AS engagement_scope,
+            e.exclusions AS engagement_exclusions, e.rules_of_engagement,
+            e.lead_name AS engagement_lead, e.authorization_note AS engagement_authorization_note,
+            e.start_date AS engagement_start_date, e.end_date AS engagement_end_date
      FROM guided_assessments ga
      JOIN assets a ON a.id = ga.asset_id AND a.organization_id = ga.organization_id
+     LEFT JOIN assessment_engagements e
+            ON e.id = ga.engagement_id AND e.organization_id = ga.organization_id
      WHERE ga.id = :id AND ga.organization_id = :organization_id
      LIMIT 1'
 );
@@ -38,7 +44,7 @@ foreach (assessment_frameworks() as $framework) {
     }
 }
 $controls = array_values(array_filter(
-    assessment_controls(),
+    assessment_controls_for_asset_type($assessment['asset_type']),
     static fn (array $control): bool => count(array_intersect($control['frameworks'], $frameworks)) > 0
 ));
 $answerQuery = db()->prepare(
@@ -83,6 +89,18 @@ $report->paragraph(
     [0.13, 0.31, 0.43]
 );
 $report->paragraph('Scope: ' . $assessment['scope'], 9);
+if ($assessment['engagement_title'] !== null) {
+    $report->section('Authorised engagement');
+    $report->paragraph(
+        $assessment['engagement_title'] . ' · Lead: ' . $assessment['engagement_lead']
+            . ' · Approved dates: ' . $assessment['engagement_start_date'] . ' to ' . $assessment['engagement_end_date'],
+        9
+    );
+    $report->paragraph('Authorisation reference: ' . $assessment['engagement_authorization_note'], 9);
+    $report->paragraph('In scope: ' . $assessment['engagement_scope'], 9);
+    $report->paragraph('Out of scope: ' . $assessment['engagement_exclusions'], 9);
+    $report->paragraph('Rules of engagement: ' . $assessment['rules_of_engagement'], 9);
+}
 $report->paragraph('Baselines: ' . implode('; ', $frameworkNames), 9);
 $report->metrics([
     ['label' => 'WEIGHTED SELF-ASSESSMENT', 'value' => (int) $assessment['overall_score'] . '% in place'],

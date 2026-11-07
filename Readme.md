@@ -61,6 +61,8 @@ Before deploying this feature to an existing installation, back up the database 
 
 Guided assessments require [`database/migrations/20261106_add_guided_assessments.sql`](./database/migrations/20261106_add_guided_assessments.sql). Back up the database and apply it with the same schema administrator before deploying the guided-assessment application code.
 
+Authorised engagement records require [`database/migrations/20261107_add_assessment_engagements.sql`](./database/migrations/20261107_add_assessment_engagements.sql), applied after the guided-assessments migration. This adds an organisation-scoped engagement register, optional guided-assessment links and the Cancelled draft state.
+
 If Apache does not route `/api/...` to `api/index.php`, enable `mod_rewrite`, allow overrides for the project directory, and restart Apache.
 
 ### PHP built-in server (local development only)
@@ -92,9 +94,12 @@ All responses use JSON shaped as `{ "data": ... }` or `{ "error": { "message": .
 | PATCH | `/api/assets/{id}` | Update an asset status |
 | DELETE | `/api/assets/{id}` | Permanently remove an asset and its related findings, reviews and history |
 | GET | `/api/assessments/catalog` | Read the available original assessment questions and baseline themes |
+| GET, POST | `/api/assessments/engagements` | List or record organisation-scoped authorised engagement windows |
+| PATCH | `/api/assessments/engagements/{id}` | Complete or cancel an open engagement |
 | GET, POST | `/api/assessments/guided` | List or start a guided evidence-based assessment |
 | GET | `/api/assessments/guided/{id}` | Read an organisation-scoped assessment and its responses |
 | POST | `/api/assessments/guided/{id}/answers` | Save draft responses |
+| POST | `/api/assessments/guided/{id}/cancel` | Cancel a draft without generating findings |
 | POST | `/api/assessments/guided/{id}/complete` | Complete an assessment and create prioritised follow-up findings |
 | POST | `/api/assessments` | Record a manual review and 0–100 risk score |
 | GET | `/api/findings?asset_id={id}` | List findings, optionally filtered to one organisation asset |
@@ -113,6 +118,8 @@ Database assets are reviewed with an organisation-shared guided checklist coveri
 Failed Website/API review checks are added as findings automatically. A later review resolves prior open/in-progress scanner-generated findings before creating findings for any remaining issues; manually recorded findings are not changed. Removing an asset permanently deletes its findings, review results and assessment history.
 
 Guided assessments use original plain-language prompts and support one or more of six high-level baselines, including a dedicated Database & data resilience baseline. Mappings indicate related themes, not official clause-by-clause compliance. The maturity score is a weighted self-reported percentage (implemented = 100%, partial = 50%, not in place/not sure = 0%; not applicable is excluded). Gaps create follow-up findings; a later guided assessment resolves prior findings only for the controls it reassesses before adding current results. “Not sure” creates a verification action and is not treated as a confirmed vulnerability. The score is not a certification or independently verified audit.
+
+Engagement records capture the authorised asset, named lead, written authorisation reference, in-scope and excluded work, rules of engagement and inclusive start/end dates. Only write-role users can create or close records; guided assessments can link only to an open engagement for the same organisation and asset during its approved date window. Saving responses is blocked if a linked engagement closes or expires. Completed assessment PDFs include linked engagement details. Keep approval evidence in your organisation's approved records system; the engagement register is not a substitute for written permission, and it does not expand the safe, read-only automated checks into active testing.
 
 ## Security notes
 

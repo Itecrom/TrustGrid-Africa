@@ -972,7 +972,7 @@ input::placeholder {
 .notice-quiet strong { color:#4f666b; }
 .assessment-intro-note { display:grid; gap:.3rem; margin-bottom:1rem; padding:.9rem 1rem; border:1px solid #dcebe6; border-radius:10px; background:#f0f9f5; color:#56716b; font-size:.75rem; line-height:1.55; }
 .assessment-intro-note strong { color:#244b43; }
-.assessment-start-panel,.assessment-history-panel { margin-bottom:1rem; }
+.assessment-start-panel,.assessment-history-panel,.engagement-panel { margin-bottom:1rem; }
 .guided-assessment-form { display:grid; grid-template-columns:1fr 1fr; gap:.85rem; align-items:end; }
 .guided-assessment-form > label { color:#29424d; font-size:.78rem; font-weight:650; }
 .guided-assessment-form input:not([type="checkbox"]),
@@ -997,6 +997,17 @@ input::placeholder {
 .framework-option strong { color:#304c55; font-size:.68rem; line-height:1.4; }
 .framework-option small { margin-top:.18rem; color:#7c8e92; font-size:.62rem; line-height:1.45; }
 .assessment-history-list { display:grid; gap:.55rem; }
+.assessment-engagement-list { display:grid; gap:.65rem; margin-top:1rem; }
+.assessment-engagement-card { display:flex; align-items:flex-start; justify-content:space-between; gap:1rem; padding:.9rem; border:1px solid #e7eeec; border-radius:10px; background:#fff; }
+.assessment-engagement-details { min-width:0; flex:1; }
+.assessment-engagement-heading { display:flex; align-items:center; flex-wrap:wrap; gap:.55rem; }
+.assessment-engagement-heading h3 { margin:0; color:#27444d; font-size:.8rem; }
+.assessment-engagement-details > p { margin:.3rem 0 0; color:#71858a; font-size:.67rem; line-height:1.55; overflow-wrap:anywhere; }
+.assessment-engagement-scope { margin-top:.5rem; color:#536b70; font-size:.68rem; line-height:1.55; }
+.assessment-engagement-scope summary { color:#20836f; font-weight:650; cursor:pointer; }
+.assessment-engagement-scope p { margin:.4rem 0 0; overflow-wrap:anywhere; }
+.assessment-engagement-actions { display:flex; flex-wrap:wrap; gap:.4rem; }
+.engagement-form > label small { display:block; margin-top:.3rem; color:#829297; font-size:.63rem; font-weight:400; line-height:1.45; }
 .assessment-history-card { display:flex; align-items:center; justify-content:space-between; gap:.8rem; padding:.8rem; border:1px solid #e7eeec; border-radius:10px; background:#fff; }
 .assessment-history-card h3 { margin:0; color:#27444d; font-size:.8rem; }
 .assessment-history-card p { margin:.25rem 0 0; color:#7a8d91; font-size:.66rem; line-height:1.5; }
@@ -1177,7 +1188,7 @@ input::placeholder {
   .assessment-form,.finding-form { grid-template-columns:1fr; }
   .guided-assessment-form,.framework-options,.assessment-result-stats { grid-template-columns:1fr; }
   .guided-assessment-form .assessment-scope-field,.guided-assessment-form .framework-picker,.guided-assessment-form > .form-message { grid-column:auto; }
-  .assessment-history-card,.guided-workspace-heading { align-items:flex-start; flex-direction:column; }
+  .assessment-history-card,.assessment-engagement-card,.guided-workspace-heading { align-items:flex-start; flex-direction:column; }
   .guided-assessment-actions { grid-template-columns:1fr; }
   .assessment-form .assessment-summary,.finding-form .finding-description-field,.assessment-form > .form-message,.finding-form > .form-message { grid-column:auto; }
   .finding-card-top { flex-direction:column; }

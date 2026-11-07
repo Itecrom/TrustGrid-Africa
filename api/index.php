@@ -274,6 +274,168 @@ try {
         json_response(['data' => ['assets' => $statement->fetchAll()]]);
     }
 
+    if ($route === '/assessments/engagements' && $method === 'GET') {
+        $statement = db()->prepare(
+            'SELECT e.id, e.asset_id, e.title, e.scope_text, e.exclusions,
+                    e.rules_of_engagement, e.lead_name, e.authorization_note,
+                    e.authorization_confirmed, e.start_date, e.end_date,
+                    CASE
+                      WHEN e.status = "Planned" AND e.start_date <= UTC_DATE() AND e.end_date >= UTC_DATE()
+                        THEN "Active"
+                      WHEN e.status IN ("Planned", "Active") AND e.end_date < UTC_DATE()
+                        THEN "Expired"
+                      ELSE e.status
+                    END AS status,
+                    e.created_at, a.name AS asset_name, a.type AS asset_type,
+                    (SELECT COUNT(*) FROM guided_assessments ga
+                     WHERE ga.organization_id = e.organization_id AND ga.engagement_id = e.id) AS assessment_count
+             FROM assessment_engagements e
+             JOIN assets a ON a.id = e.asset_id AND a.organization_id = e.organization_id
+             WHERE e.organization_id = :organization_id
+             ORDER BY e.start_date DESC, e.id DESC LIMIT 100'
+        );
+        $statement->execute(['organization_id' => $orgId]);
+        $engagements = $statement->fetchAll();
+        foreach ($engagements as &$engagement) {
+            $engagement['id'] = (int) $engagement['id'];
+            $engagement['asset_id'] = (int) $engagement['asset_id'];
+            $engagement['authorization_confirmed'] = (bool) $engagement['authorization_confirmed'];
+            $engagement['assessment_count'] = (int) $engagement['assessment_count'];
+        }
+        unset($engagement);
+        json_response(['data' => ['engagements' => $engagements]]);
+    }
+
+    if ($route === '/assessments/engagements' && $method === 'POST') {
+        require_write_role($user);
+        $input = request_json();
+        $title = required_string($input, 'title', 180, 'Engagement name');
+        $scope = required_string($input, 'scope_text', 10000, 'In-scope work');
+        $exclusions = required_string($input, 'exclusions', 10000, 'Out-of-scope work');
+        $rules = required_string($input, 'rules_of_engagement', 10000, 'Rules of engagement');
+        $leadName = required_string($input, 'lead_name', 120, 'Engagement lead');
+        $authorizationNote = required_string($input, 'authorization_note', 500, 'Authorisation details');
+        if (($input['authorization_confirmed'] ?? false) !== true) {
+            throw new ApiException(422, 'Confirm that the named lead has documented authorisation for this engagement.');
+        }
+        $assetId = filter_var($input['asset_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if ($assetId === false) {
+            throw new ApiException(422, 'Choose an authorised asset for this engagement.');
+        }
+        $parseDate = static function (mixed $value, string $label): DateTimeImmutable {
+            if (!is_string($value) || preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) !== 1) {
+                throw new ApiException(422, $label . ' must be a valid calendar date.');
+            }
+            $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value, new DateTimeZone('UTC'));
+            $errors = DateTimeImmutable::getLastErrors();
+            if ($date === false || ($errors !== false && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))
+                || $date->format('Y-m-d') !== $value) {
+                throw new ApiException(422, $label . ' must be a valid calendar date.');
+            }
+            return $date;
+        };
+        $startDate = $parseDate($input['start_date'] ?? null, 'Start date');
+        $endDate = $parseDate($input['end_date'] ?? null, 'End date');
+        $today = new DateTimeImmutable(gmdate('Y-m-d'), new DateTimeZone('UTC'));
+        if ($endDate < $startDate || $endDate < $today) {
+            throw new ApiException(422, 'The engagement end date must be on or after its start date and not in the past.');
+        }
+        $assetQuery = db()->prepare(
+            'SELECT id FROM assets
+             WHERE id = :id AND organization_id = :organization_id
+               AND authorization_confirmed = 1 AND status <> "Archived"
+             LIMIT 1'
+        );
+        $assetQuery->execute(['id' => $assetId, 'organization_id' => $orgId]);
+        if ($assetQuery->fetchColumn() === false) {
+            throw new ApiException(404, 'Authorised, active asset not found.');
+        }
+        $statement = db()->prepare(
+            'INSERT INTO assessment_engagements
+                (organization_id, asset_id, title, scope_text, exclusions, rules_of_engagement,
+                 lead_name, authorization_note, authorization_confirmed, start_date, end_date, status, created_by)
+             VALUES
+                (:organization_id, :asset_id, :title, :scope_text, :exclusions, :rules_of_engagement,
+                 :lead_name, :authorization_note, 1, :start_date, :end_date, :status, :created_by)'
+        );
+        $statement->execute([
+            'organization_id' => $orgId,
+            'asset_id' => (int) $assetId,
+            'title' => $title,
+            'scope_text' => $scope,
+            'exclusions' => $exclusions,
+            'rules_of_engagement' => $rules,
+            'lead_name' => $leadName,
+            'authorization_note' => $authorizationNote,
+            'start_date' => $startDate->format('Y-m-d'),
+            'end_date' => $endDate->format('Y-m-d'),
+            'status' => $startDate > $today ? 'Planned' : 'Active',
+            'created_by' => (int) $user['id'],
+        ]);
+        json_response(['data' => ['id' => (int) db()->lastInsertId()]], 201);
+    }
+
+    if (preg_match('#^/assessments/engagements/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'PATCH') {
+        require_write_role($user);
+        $input = request_json();
+        $status = $input['status'] ?? null;
+        if (!is_string($status) || !in_array($status, ['Completed', 'Cancelled'], true)) {
+            throw new ApiException(422, 'Choose Completed or Cancelled as the engagement status.');
+        }
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $statement = $pdo->prepare(
+                'SELECT status, start_date, end_date FROM assessment_engagements
+                 WHERE id = :id AND organization_id = :organization_id LIMIT 1 FOR UPDATE'
+            );
+            $statement->execute(['id' => (int) $matches[1], 'organization_id' => $orgId]);
+            $engagement = $statement->fetch();
+            if ($engagement === false) {
+                throw new ApiException(404, 'Engagement not found.');
+            }
+            if (!in_array($engagement['status'], ['Planned', 'Active'], true)) {
+                throw new ApiException(409, 'This engagement is already closed.');
+            }
+            if ($status === 'Completed'
+                && ($engagement['start_date'] > gmdate('Y-m-d') || $engagement['end_date'] < gmdate('Y-m-d'))) {
+                throw new ApiException(409, 'An engagement can be completed only during its authorised date window.');
+            }
+            if ($status === 'Completed') {
+                $draftQuery = $pdo->prepare(
+                    'SELECT COUNT(*) FROM guided_assessments
+                     WHERE organization_id = :organization_id AND engagement_id = :engagement_id AND status = "Draft"'
+                );
+                $draftQuery->execute([
+                    'organization_id' => $orgId,
+                    'engagement_id' => (int) $matches[1],
+                ]);
+                if ((int) $draftQuery->fetchColumn() > 0) {
+                    throw new ApiException(409, 'Complete or cancel linked draft assessments before closing this engagement.');
+                }
+            }
+            $statement = $pdo->prepare(
+                'UPDATE assessment_engagements SET status = :status
+                 WHERE id = :id AND organization_id = :organization_id AND status IN ("Planned", "Active")'
+            );
+            $statement->execute([
+                'status' => $status,
+                'id' => (int) $matches[1],
+                'organization_id' => $orgId,
+            ]);
+            if ($statement->rowCount() !== 1) {
+                throw new ApiException(409, 'The engagement status changed. Refresh and try again.');
+            }
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['updated' => true]]);
+    }
+
     if ($route === '/assessments/catalog' && $method === 'GET') {
         json_response(['data' => [
             'frameworks' => assessment_frameworks(),
@@ -290,20 +452,22 @@ try {
 
     if ($route === '/assessments/guided' && $method === 'GET') {
         $statement = db()->prepare(
-            'SELECT ga.id, ga.asset_id, ga.title, ga.scope, ga.frameworks_json, ga.status,
+            'SELECT ga.id, ga.asset_id, ga.engagement_id, ga.title, ga.scope, ga.frameworks_json, ga.status,
                     ga.overall_score, ga.created_at, ga.updated_at, ga.completed_at,
-                    a.name AS asset_name,
+                    a.name AS asset_name, e.title AS engagement_title,
                     COUNT(DISTINCT gaa.control_id) AS answered_count,
                     (SELECT COUNT(*) FROM findings f
                      WHERE f.assessment_id = ga.completed_assessment_id
                        AND f.organization_id = ga.organization_id) AS findings_count
              FROM guided_assessments ga
              JOIN assets a ON a.id = ga.asset_id AND a.organization_id = ga.organization_id
+             LEFT JOIN assessment_engagements e
+                    ON e.id = ga.engagement_id AND e.organization_id = ga.organization_id
              LEFT JOIN guided_assessment_answers gaa
                     ON gaa.organization_id = ga.organization_id
                    AND gaa.guided_assessment_id = ga.id
              WHERE ga.organization_id = :organization_id
-             GROUP BY ga.id, a.name
+             GROUP BY ga.id, a.name, e.title
              ORDER BY ga.updated_at DESC, ga.id DESC LIMIT 50'
         );
         $statement->execute(['organization_id' => $orgId]);
@@ -311,6 +475,9 @@ try {
         foreach ($assessments as &$assessment) {
             $assessment['id'] = (int) $assessment['id'];
             $assessment['asset_id'] = (int) $assessment['asset_id'];
+            $assessment['engagement_id'] = $assessment['engagement_id'] === null
+                ? null
+                : (int) $assessment['engagement_id'];
             $assessment['overall_score'] = $assessment['overall_score'] === null
                 ? null
                 : (int) $assessment['overall_score'];
@@ -329,9 +496,12 @@ try {
         $title = required_string($input, 'title', 180, 'Assessment name');
         $scope = required_string($input, 'scope', 10000, 'Assessment scope');
         $assetId = filter_var($input['asset_id'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        $engagementId = ($input['engagement_id'] ?? '') === ''
+            ? null
+            : filter_var($input['engagement_id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
         $frameworks = $input['frameworks'] ?? null;
         $validFrameworks = array_column(assessment_frameworks(), 'id');
-        if ($assetId === false || !is_array($frameworks) || $frameworks === []) {
+        if ($assetId === false || $engagementId === false || !is_array($frameworks) || $frameworks === []) {
             throw new ApiException(422, 'Choose an asset and at least one assessment baseline.');
         }
         $frameworks = array_values(array_unique($frameworks));
@@ -360,30 +530,87 @@ try {
         if ($matchingControls === []) {
             throw new ApiException(422, 'The selected baselines do not include questions for this asset type.');
         }
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            if ($engagementId !== null) {
+                $engagementQuery = $pdo->prepare(
+                    'SELECT id FROM assessment_engagements
+                     WHERE id = :id AND organization_id = :organization_id AND asset_id = :asset_id
+                       AND status IN ("Planned", "Active")
+                       AND start_date <= UTC_DATE() AND end_date >= UTC_DATE()
+                     LIMIT 1 FOR UPDATE'
+                );
+                $engagementQuery->execute([
+                    'id' => $engagementId,
+                    'organization_id' => $orgId,
+                    'asset_id' => (int) $assetId,
+                ]);
+                if ($engagementQuery->fetchColumn() === false) {
+                    throw new ApiException(422, 'Choose an open engagement for the same asset that is within its authorised date window.');
+                }
+            }
+            $statement = $pdo->prepare(
+                'INSERT INTO guided_assessments
+                    (organization_id, asset_id, engagement_id, title, scope, frameworks_json, created_by)
+                 VALUES
+                    (:organization_id, :asset_id, :engagement_id, :title, :scope, :frameworks_json, :created_by)'
+            );
+            $statement->execute([
+                'organization_id' => $orgId,
+                'asset_id' => (int) $assetId,
+                'engagement_id' => $engagementId,
+                'title' => $title,
+                'scope' => $scope,
+                'frameworks_json' => json_encode($frameworks, JSON_THROW_ON_ERROR),
+                'created_by' => (int) $user['id'],
+            ]);
+            $assessmentId = (int) $pdo->lastInsertId();
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['id' => $assessmentId]], 201);
+    }
+
+    if (preg_match('#^/assessments/guided/([1-9][0-9]*)/cancel$#', $route, $matches) === 1 && $method === 'POST') {
+        require_write_role($user);
         $statement = db()->prepare(
-            'INSERT INTO guided_assessments
-                (organization_id, asset_id, title, scope, frameworks_json, created_by)
-             VALUES
-                (:organization_id, :asset_id, :title, :scope, :frameworks_json, :created_by)'
+            'UPDATE guided_assessments SET status = "Cancelled"
+             WHERE id = :id AND organization_id = :organization_id AND status = "Draft"'
         );
-        $statement->execute([
-            'organization_id' => $orgId,
-            'asset_id' => (int) $assetId,
-            'title' => $title,
-            'scope' => $scope,
-            'frameworks_json' => json_encode($frameworks, JSON_THROW_ON_ERROR),
-            'created_by' => (int) $user['id'],
-        ]);
-        json_response(['data' => ['id' => (int) db()->lastInsertId()]], 201);
+        $statement->execute(['id' => (int) $matches[1], 'organization_id' => $orgId]);
+        if ($statement->rowCount() !== 1) {
+            $check = db()->prepare(
+                'SELECT status FROM guided_assessments
+                 WHERE id = :id AND organization_id = :organization_id'
+            );
+            $check->execute(['id' => (int) $matches[1], 'organization_id' => $orgId]);
+            $status = $check->fetchColumn();
+            if ($status === false) {
+                throw new ApiException(404, 'Assessment not found.');
+            }
+            throw new ApiException(409, 'Only draft assessments can be cancelled.');
+        }
+        json_response(['data' => ['cancelled' => true]]);
     }
 
     if (preg_match('#^/assessments/guided/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'GET') {
         $statement = db()->prepare(
-            'SELECT ga.id, ga.asset_id, ga.title, ga.scope, ga.frameworks_json, ga.status,
+            'SELECT ga.id, ga.asset_id, ga.engagement_id, ga.title, ga.scope, ga.frameworks_json, ga.status,
                     ga.overall_score, ga.created_at, ga.updated_at, ga.completed_at,
-                    a.name AS asset_name, a.type AS asset_type, ga.completed_assessment_id
+                    a.name AS asset_name, a.type AS asset_type, ga.completed_assessment_id,
+                    e.title AS engagement_title, e.scope_text AS engagement_scope,
+                    e.exclusions AS engagement_exclusions, e.rules_of_engagement,
+                    e.lead_name AS engagement_lead, e.authorization_note AS engagement_authorization_note,
+                    e.start_date AS engagement_start_date, e.end_date AS engagement_end_date
              FROM guided_assessments ga
              JOIN assets a ON a.id = ga.asset_id AND a.organization_id = ga.organization_id
+             LEFT JOIN assessment_engagements e
+                    ON e.id = ga.engagement_id AND e.organization_id = ga.organization_id
              WHERE ga.id = :id AND ga.organization_id = :organization_id LIMIT 1'
         );
         $statement->execute(['id' => (int) $matches[1], 'organization_id' => $orgId]);
@@ -393,6 +620,9 @@ try {
         }
         $assessment['id'] = (int) $assessment['id'];
         $assessment['asset_id'] = (int) $assessment['asset_id'];
+        $assessment['engagement_id'] = $assessment['engagement_id'] === null
+            ? null
+            : (int) $assessment['engagement_id'];
         $assessment['overall_score'] = $assessment['overall_score'] === null
             ? null
             : (int) $assessment['overall_score'];
@@ -482,7 +712,7 @@ try {
                  FROM guided_assessments ga
                  JOIN assets a ON a.id = ga.asset_id AND a.organization_id = ga.organization_id
                  WHERE ga.id = :id AND ga.organization_id = :organization_id
-                 FOR UPDATE'
+                 '
             );
             $statement->execute(['id' => (int) $matches[1], 'organization_id' => $orgId]);
             $assessment = $statement->fetch();
