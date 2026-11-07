@@ -5,6 +5,7 @@ require __DIR__ . '/../app/bootstrap.php';
 require __DIR__ . '/../app/http.php';
 require __DIR__ . '/../app/safe_web_review.php';
 require __DIR__ . '/../app/assessment_catalog.php';
+require __DIR__ . '/../app/platform.php';
 
 try {
     $path = rawurldecode((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/'));
@@ -25,8 +26,128 @@ try {
         require_csrf();
     }
 
+    if ($route === '/public/challenge' && $method === 'GET') {
+        json_response(['data' => issue_public_form_challenge()]);
+    }
+
+    if ($route === '/news' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $search = trim((string) ($_GET['q'] ?? ''));
+        if (mb_strlen($search) > 100) {
+            throw new ApiException(422, 'News search must be 100 characters or fewer.');
+        }
+        $pdo = db();
+        $where = 'status = "Published" AND published_at <= UTC_TIMESTAMP()';
+        $parameters = [];
+        if ($search !== '') {
+            $where .= ' AND (title LIKE :search_title OR summary LIKE :search_summary OR body_html LIKE :search_body)';
+            $parameters['search_title'] = '%' . $search . '%';
+            $parameters['search_summary'] = '%' . $search . '%';
+            $parameters['search_body'] = '%' . $search . '%';
+        }
+        $count = $pdo->prepare('SELECT COUNT(*) FROM news_articles WHERE ' . $where);
+        $count->execute($parameters);
+        $total = (int) $count->fetchColumn();
+        $limit = 9;
+        $offset = ($page - 1) * $limit;
+        $statement = $pdo->prepare(
+            'SELECT id, slug, title, summary, featured_image_path, published_at
+             FROM news_articles WHERE ' . $where . '
+             ORDER BY published_at DESC, id DESC LIMIT :limit OFFSET :offset'
+        );
+        foreach ($parameters as $key => $value) {
+            $statement->bindValue(':' . $key, $value);
+        }
+        $statement->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $statement->bindValue(':offset', $offset, PDO::PARAM_INT);
+        $statement->execute();
+        $latest = $pdo->query(
+            'SELECT slug, title, featured_image_path, published_at
+             FROM news_articles WHERE status = "Published" AND published_at <= UTC_TIMESTAMP()
+             ORDER BY published_at DESC, id DESC LIMIT 5'
+        );
+        json_response(['data' => [
+            'articles' => $statement->fetchAll(),
+            'latest' => $latest->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => max(1, (int) ceil($total / $limit))],
+            'query' => $search,
+        ]]);
+    }
+
+    if (preg_match('#^/news/([a-z0-9][a-z0-9-]{0,179})$#', $route, $matches) === 1 && $method === 'GET') {
+        $statement = db()->prepare(
+            'SELECT id, slug, title, summary, body_html, featured_image_path, published_at
+             FROM news_articles
+             WHERE slug = :slug AND status = "Published" AND published_at <= UTC_TIMESTAMP()
+             LIMIT 1'
+        );
+        $statement->execute(['slug' => $matches[1]]);
+        $article = $statement->fetch();
+        if ($article === false) {
+            throw new ApiException(404, 'News article not found.');
+        }
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $limit = 20;
+        $count = db()->prepare(
+            'SELECT COUNT(*) FROM news_comments WHERE article_id = :article_id AND status = "Approved"'
+        );
+        $count->execute(['article_id' => (int) $article['id']]);
+        $total = (int) $count->fetchColumn();
+        $comments = db()->prepare(
+            'SELECT display_name, body_text, created_at FROM news_comments
+             WHERE article_id = :article_id AND status = "Approved"
+             ORDER BY created_at DESC, id DESC LIMIT :limit OFFSET :offset'
+        );
+        $comments->bindValue(':article_id', (int) $article['id'], PDO::PARAM_INT);
+        $comments->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $comments->bindValue(':offset', ($page - 1) * $limit, PDO::PARAM_INT);
+        $comments->execute();
+        json_response(['data' => [
+            'article' => $article,
+            'comments' => $comments->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => $limit, 'total' => $total, 'pages' => max(1, (int) ceil($total / $limit))],
+        ]]);
+    }
+
+    if (preg_match('#^/news/([a-z0-9][a-z0-9-]{0,179})/comments$#', $route, $matches) === 1 && $method === 'POST') {
+        $input = request_json();
+        verify_public_form_challenge($input);
+        enforce_public_form_limit(db(), 'news-comment', 5, 600);
+        $name = required_string($input, 'display_name', 120, 'Name');
+        $email = strtolower(required_string($input, 'email', 254, 'Email'));
+        $body = required_string($input, 'body_text', 3000, 'Comment');
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            throw new ApiException(422, 'Enter a valid email address.');
+        }
+        $articleQuery = db()->prepare(
+            'SELECT id FROM news_articles
+             WHERE slug = :slug AND status = "Published" AND published_at <= UTC_TIMESTAMP()
+             LIMIT 1'
+        );
+        $articleQuery->execute(['slug' => $matches[1]]);
+        $articleId = $articleQuery->fetchColumn();
+        if ($articleId === false) {
+            throw new ApiException(404, 'News article not found.');
+        }
+        $currentUser = current_user();
+        $statement = db()->prepare(
+            'INSERT INTO news_comments (article_id, user_id, display_name, email, body_text)
+             VALUES (:article_id, :user_id, :display_name, :email, :body_text)'
+        );
+        $statement->execute([
+            'article_id' => (int) $articleId,
+            'user_id' => $currentUser === null ? null : (int) $currentUser['id'],
+            'display_name' => $name,
+            'email' => $email,
+            'body_text' => $body,
+        ]);
+        record_user_action($currentUser === null ? null : (int) $currentUser['id'], null, 'news.comment_submitted', 'news_comment', (int) db()->lastInsertId());
+        json_response(['data' => ['submitted' => true, 'message' => 'Your comment is awaiting moderator approval.']], 202);
+    }
+
     if ($route === '/auth/register' && $method === 'POST') {
         $input = request_json();
+        verify_public_form_challenge($input);
         $name = required_string($input, 'full_name', 120, 'Name');
         $email = strtolower(required_string($input, 'email', 254, 'Email'));
         $organization = required_string($input, 'organization_name', 160, 'Organisation name');
@@ -47,7 +168,7 @@ try {
         $pdo->beginTransaction();
         try {
             $statement = $pdo->prepare(
-                'INSERT INTO organizations (name, country) VALUES (:name, :country)'
+                'INSERT INTO organizations (name, country, status) VALUES (:name, :country, "pending")'
             );
             $statement->execute(['name' => $organization, 'country' => $country]);
             $organizationId = (int) $pdo->lastInsertId();
@@ -63,6 +184,7 @@ try {
                 'password_hash' => password_hash($password, PASSWORD_DEFAULT),
             ]);
             $userId = (int) $pdo->lastInsertId();
+            record_user_action($userId, $organizationId, 'workspace.created_pending_approval', 'organization', $organizationId);
             $pdo->commit();
         } catch (PDOException $exception) {
             if ($pdo->inTransaction()) {
@@ -74,10 +196,8 @@ try {
             throw $exception;
         }
 
-        session_regenerate_id(true);
-        $_SESSION['user_id'] = $userId;
-        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-        json_response(['data' => ['user' => ['id' => $userId, 'organization_id' => $organizationId]]], 201);
+        unset($_SESSION['public_form_challenge']);
+        json_response(['data' => ['pending_approval' => true, 'message' => 'Your workspace request was received and is awaiting super-admin approval.']], 202);
     }
 
     if ($route === '/auth/login' && $method === 'POST') {
@@ -115,9 +235,9 @@ try {
         }
 
         $statement = $pdo->prepare(
-            'SELECT u.id, u.password_hash
+            'SELECT u.id, u.password_hash, u.organization_id, u.role, o.status AS organization_status
              FROM users u JOIN organizations o ON o.id = u.organization_id
-             WHERE u.email = :email AND u.status = "active" AND o.status = "active"
+             WHERE u.email = :email AND u.status = "active"
              ORDER BY u.id LIMIT 1'
         );
         $statement->execute(['email' => $email]);
@@ -131,8 +251,17 @@ try {
             $pdo->commit();
             throw new ApiException(401, 'The email or password is incorrect.');
         }
+        if ($account['organization_status'] === 'pending') {
+            $pdo->commit();
+            throw new ApiException(403, 'Your workspace is awaiting super-admin approval.');
+        }
+        if ($account['organization_status'] !== 'active') {
+            $pdo->commit();
+            throw new ApiException(403, 'This workspace is not available.');
+        }
 
         $pdo->prepare('DELETE FROM login_attempts WHERE ip_hash = :ip_hash')->execute(['ip_hash' => $ipHash]);
+        record_user_action((int) $account['id'], (int) $account['organization_id'], 'auth.login', 'user', (int) $account['id']);
         $pdo->commit();
         session_regenerate_id(true);
         $_SESSION['user_id'] = (int) $account['id'];
@@ -164,6 +293,355 @@ try {
 
     $user = require_api_user();
     $orgId = organization_id($user);
+
+    if ($route === '/profile' && $method === 'GET') {
+        $statement = db()->prepare(
+            'SELECT u.full_name, u.email, u.role, p.bio, p.avatar_path, p.school, p.work, p.qualifications,
+                    p.updated_at, o.name AS organization_name
+             FROM users u JOIN organizations o ON o.id = u.organization_id
+             LEFT JOIN user_profiles p ON p.user_id = u.id
+             WHERE u.id = :user_id AND u.organization_id = :organization_id'
+        );
+        $statement->execute(['user_id' => (int) $user['id'], 'organization_id' => $orgId]);
+        json_response(['data' => ['profile' => $statement->fetch()]]);
+    }
+
+    if ($route === '/profile' && $method === 'POST') {
+        $input = request_json();
+        $name = required_string($input, 'full_name', 120, 'Name');
+        $bio = optional_string($input, 'bio', 2000, 'Bio');
+        $school = optional_string($input, 'school', 180, 'School');
+        $work = optional_string($input, 'work', 180, 'Workplace');
+        $qualifications = optional_string($input, 'qualifications', 3000, 'Qualifications');
+        $pdo = db();
+        $pdo->beginTransaction();
+        try {
+            $pdo->prepare(
+                'UPDATE users SET full_name = :full_name WHERE id = :user_id AND organization_id = :organization_id'
+            )->execute([
+                'full_name' => $name,
+                'user_id' => (int) $user['id'],
+                'organization_id' => $orgId,
+            ]);
+            $pdo->prepare(
+                'INSERT INTO user_profiles (user_id, bio, school, work, qualifications)
+                 VALUES (:user_id, :bio, :school, :work, :qualifications)
+                 ON DUPLICATE KEY UPDATE bio = VALUES(bio), school = VALUES(school),
+                   work = VALUES(work), qualifications = VALUES(qualifications)'
+            )->execute([
+                'user_id' => (int) $user['id'],
+                'bio' => $bio,
+                'school' => $school,
+                'work' => $work,
+                'qualifications' => $qualifications,
+            ]);
+            record_user_action((int) $user['id'], $orgId, 'profile.updated', 'user', (int) $user['id']);
+            $pdo->commit();
+        } catch (Throwable $exception) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $exception;
+        }
+        json_response(['data' => ['updated' => true]]);
+    }
+
+    if ($route === '/profile/avatar' && $method === 'POST') {
+        $avatarPath = store_profile_avatar($_FILES['avatar'] ?? []);
+        $statement = db()->prepare(
+            'INSERT INTO user_profiles (user_id, bio, school, work, qualifications, avatar_path)
+             VALUES (:user_id, "", "", "", "", :avatar_path)
+             ON DUPLICATE KEY UPDATE avatar_path = VALUES(avatar_path)'
+        );
+        $statement->execute(['user_id' => (int) $user['id'], 'avatar_path' => $avatarPath]);
+        record_user_action((int) $user['id'], $orgId, 'profile.avatar_updated', 'user', (int) $user['id']);
+        json_response(['data' => ['avatar_path' => app_url($avatarPath)]]);
+    }
+
+    if (str_starts_with($route, '/admin/')) {
+        require_super_admin($user);
+    }
+
+    if ($route === '/admin/summary' && $method === 'GET') {
+        $pdo = db();
+        $counts = $pdo->query(
+            'SELECT
+               (SELECT COUNT(*) FROM organizations WHERE status = "pending") AS pending_workspaces,
+               (SELECT COUNT(*) FROM organizations WHERE status = "active") AS active_workspaces,
+               (SELECT COUNT(*) FROM users WHERE status = "active") AS active_users,
+               (SELECT COUNT(*) FROM news_articles WHERE status = "Published") AS published_articles,
+               (SELECT COUNT(*) FROM news_comments WHERE status = "Pending") AS pending_comments'
+        )->fetch();
+        json_response(['data' => ['counts' => $counts]]);
+    }
+
+    if ($route === '/admin/workspaces' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $status = (string) ($_GET['status'] ?? 'pending');
+        if (!in_array($status, ['pending', 'active', 'suspended', 'rejected'], true)) {
+            throw new ApiException(422, 'Choose a valid workspace status.');
+        }
+        $count = db()->prepare('SELECT COUNT(*) FROM organizations WHERE status = :status');
+        $count->execute(['status' => $status]);
+        $total = (int) $count->fetchColumn();
+        $statement = db()->prepare(
+            'SELECT o.id, o.name, o.country, o.status, o.created_at,
+                    u.id AS creator_id, u.full_name AS creator_name, u.email AS creator_email
+             FROM organizations o JOIN users u ON u.organization_id = o.id AND u.role = "admin"
+             WHERE o.status = :status
+             ORDER BY o.created_at DESC, o.id DESC LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':status', $status);
+        $statement->bindValue(':limit', 20, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * 20, PDO::PARAM_INT);
+        $statement->execute();
+        json_response(['data' => [
+            'workspaces' => $statement->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => max(1, (int) ceil($total / 20))],
+        ]]);
+    }
+
+    if (preg_match('#^/admin/workspaces/([1-9][0-9]*)/decision$#', $route, $matches) === 1 && $method === 'POST') {
+        $input = request_json();
+        $decision = $input['decision'] ?? null;
+        if (!is_string($decision) || !in_array($decision, ['approve', 'reject'], true)) {
+            throw new ApiException(422, 'Choose approve or reject.');
+        }
+        $status = $decision === 'approve' ? 'active' : 'rejected';
+        $statement = db()->prepare(
+            'UPDATE organizations SET status = :status
+             WHERE id = :id AND status = "pending"'
+        );
+        $statement->execute(['status' => $status, 'id' => (int) $matches[1]]);
+        if ($statement->rowCount() !== 1) {
+            throw new ApiException(409, 'This workspace request is no longer pending.');
+        }
+        record_user_action((int) $user['id'], null, 'workspace.' . $decision . 'd', 'organization', (int) $matches[1]);
+        json_response(['data' => ['status' => $status]]);
+    }
+
+    if ($route === '/admin/logs' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $count = (int) db()->query('SELECT COUNT(*) FROM user_action_logs')->fetchColumn();
+        $statement = db()->prepare(
+            'SELECT l.id, l.action, l.target_type, l.target_id, l.details_json, l.created_at,
+                    u.full_name AS actor_name, u.email AS actor_email,
+                    o.name AS organization_name
+             FROM user_action_logs l
+             LEFT JOIN users u ON u.id = l.actor_user_id
+             LEFT JOIN organizations o ON o.id = l.organization_id
+             ORDER BY l.id DESC LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':limit', 50, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * 50, PDO::PARAM_INT);
+        $statement->execute();
+        $logs = $statement->fetchAll();
+        foreach ($logs as &$log) {
+            $log['details'] = $log['details_json'] === null ? null : json_decode($log['details_json'], true, 16, JSON_THROW_ON_ERROR);
+            unset($log['details_json']);
+        }
+        unset($log);
+        json_response(['data' => [
+            'logs' => $logs,
+            'pagination' => ['page' => $page, 'per_page' => 50, 'total' => $count, 'pages' => max(1, (int) ceil($count / 50))],
+        ]]);
+    }
+
+    if ($route === '/admin/comments' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $status = (string) ($_GET['status'] ?? 'Pending');
+        if (!in_array($status, ['Pending', 'Approved', 'Rejected'], true)) {
+            throw new ApiException(422, 'Choose a valid comment status.');
+        }
+        $count = db()->prepare('SELECT COUNT(*) FROM news_comments WHERE status = :status');
+        $count->execute(['status' => $status]);
+        $total = (int) $count->fetchColumn();
+        $statement = db()->prepare(
+            'SELECT c.id, c.display_name, c.email, c.body_text, c.status, c.created_at,
+                    a.title AS article_title, a.slug
+             FROM news_comments c JOIN news_articles a ON a.id = c.article_id
+             WHERE c.status = :status
+             ORDER BY c.created_at ASC, c.id ASC LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':status', $status);
+        $statement->bindValue(':limit', 20, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * 20, PDO::PARAM_INT);
+        $statement->execute();
+        json_response(['data' => [
+            'comments' => $statement->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $total, 'pages' => max(1, (int) ceil($total / 20))],
+        ]]);
+    }
+
+    if (preg_match('#^/admin/comments/([1-9][0-9]*)/decision$#', $route, $matches) === 1 && $method === 'POST') {
+        $input = request_json();
+        $decision = $input['decision'] ?? null;
+        $status = match ($decision) {
+            'approve' => 'Approved',
+            'reject' => 'Rejected',
+            default => null,
+        };
+        if ($status === null) {
+            throw new ApiException(422, 'Choose approve or reject.');
+        }
+        $statement = db()->prepare(
+            'UPDATE news_comments SET status = :status, moderated_by = :moderated_by, moderated_at = UTC_TIMESTAMP()
+             WHERE id = :id AND status = "Pending"'
+        );
+        $statement->execute([
+            'status' => $status,
+            'moderated_by' => (int) $user['id'],
+            'id' => (int) $matches[1],
+        ]);
+        if ($statement->rowCount() !== 1) {
+            throw new ApiException(409, 'This comment is no longer awaiting moderation.');
+        }
+        record_user_action((int) $user['id'], null, 'news.comment_' . strtolower($status), 'news_comment', (int) $matches[1]);
+        json_response(['data' => ['status' => $status]]);
+    }
+
+    if ($route === '/admin/news' && $method === 'GET') {
+        $page = max(1, min(100000, (int) ($_GET['page'] ?? 1)));
+        $count = (int) db()->query('SELECT COUNT(*) FROM news_articles')->fetchColumn();
+        $statement = db()->prepare(
+            'SELECT n.id, n.slug, n.title, n.summary, n.status, n.featured_image_path,
+                    n.created_at, n.published_at, u.full_name AS author_name
+             FROM news_articles n JOIN users u ON u.id = n.author_user_id
+             ORDER BY n.updated_at DESC, n.id DESC LIMIT :limit OFFSET :offset'
+        );
+        $statement->bindValue(':limit', 20, PDO::PARAM_INT);
+        $statement->bindValue(':offset', ($page - 1) * 20, PDO::PARAM_INT);
+        $statement->execute();
+        json_response(['data' => [
+            'articles' => $statement->fetchAll(),
+            'pagination' => ['page' => $page, 'per_page' => 20, 'total' => $count, 'pages' => max(1, (int) ceil($count / 20))],
+        ]]);
+    }
+
+    if ($route === '/admin/news-image' && $method === 'POST') {
+        $path = store_news_featured_image($_FILES['image'] ?? []);
+        record_user_action((int) $user['id'], null, 'news.image_uploaded', 'news_article');
+        json_response(['data' => ['featured_image_path' => app_url($path)]], 201);
+    }
+
+    if ($route === '/admin/news' && $method === 'POST') {
+        $input = request_json();
+        $title = required_string($input, 'title', 180, 'Title');
+        $summary = required_string($input, 'summary', 500, 'Summary');
+        $body = sanitize_news_html(required_string($input, 'body_html', 500000, 'Article text'));
+        if ($body === '') {
+            throw new ApiException(422, 'Add article text before saving.');
+        }
+        $imagePath = (string) ($input['featured_image_path'] ?? '');
+        if ($imagePath !== '' && preg_match('#^uploads/news/[a-f0-9]{40}\.(?:jpg|png|webp)$#', $imagePath) !== 1) {
+            throw new ApiException(422, 'Upload a supported featured image before saving.');
+        }
+        $status = $input['status'] ?? 'Draft';
+        if (!is_string($status) || !in_array($status, ['Draft', 'Published'], true)) {
+            throw new ApiException(422, 'Choose Draft or Published.');
+        }
+        $baseSlug = slugify_news_title($title);
+        $slug = $baseSlug;
+        $suffix = 2;
+        $checkSlug = db()->prepare('SELECT 1 FROM news_articles WHERE slug = :slug');
+        while (true) {
+            $checkSlug->execute(['slug' => $slug]);
+            if ($checkSlug->fetchColumn() === false) {
+                break;
+            }
+            $slug = substr($baseSlug, 0, 170 - strlen((string) $suffix)) . '-' . $suffix++;
+        }
+        $statement = db()->prepare(
+            'INSERT INTO news_articles
+                (author_user_id, slug, title, summary, body_html, featured_image_path, status, published_at)
+             VALUES
+                (:author_user_id, :slug, :title, :summary, :body_html, :featured_image_path, :status,
+                 CASE WHEN :published = "Published" THEN UTC_TIMESTAMP() ELSE NULL END)'
+        );
+        $statement->execute([
+            'author_user_id' => (int) $user['id'],
+            'slug' => $slug,
+            'title' => $title,
+            'summary' => $summary,
+            'body_html' => $body,
+            'featured_image_path' => $imagePath,
+            'status' => $status,
+            'published' => $status,
+        ]);
+        $articleId = (int) db()->lastInsertId();
+        record_user_action((int) $user['id'], null, 'news.article_created', 'news_article', $articleId, ['status' => $status]);
+        json_response(['data' => ['id' => $articleId, 'slug' => $slug]], 201);
+    }
+
+    if (preg_match('#^/admin/news/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'GET') {
+        $statement = db()->prepare(
+            'SELECT id, slug, title, summary, body_html, featured_image_path, status
+             FROM news_articles WHERE id = :id LIMIT 1'
+        );
+        $statement->execute(['id' => (int) $matches[1]]);
+        $article = $statement->fetch();
+        if ($article === false) {
+            throw new ApiException(404, 'News article not found.');
+        }
+        json_response(['data' => ['article' => $article]]);
+    }
+
+    if (preg_match('#^/admin/news/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'PATCH') {
+        $input = request_json();
+        $title = required_string($input, 'title', 180, 'Title');
+        $summary = required_string($input, 'summary', 500, 'Summary');
+        $body = sanitize_news_html(required_string($input, 'body_html', 500000, 'Article text'));
+        if ($body === '') {
+            throw new ApiException(422, 'Add article text before saving.');
+        }
+        $imagePath = (string) ($input['featured_image_path'] ?? '');
+        if ($imagePath !== '' && preg_match('#^uploads/news/[a-f0-9]{40}\.(?:jpg|png|webp)$#', $imagePath) !== 1) {
+            throw new ApiException(422, 'Upload a supported featured image before saving.');
+        }
+        $status = $input['status'] ?? null;
+        if (!is_string($status) || !in_array($status, ['Draft', 'Published', 'Archived'], true)) {
+            throw new ApiException(422, 'Choose Draft, Published or Archived.');
+        }
+        $statement = db()->prepare(
+            'UPDATE news_articles
+             SET title = :title, summary = :summary, body_html = :body_html,
+                 featured_image_path = :featured_image_path, status = :status,
+                 published_at = CASE
+                   WHEN :status_published = "Published" AND published_at IS NULL THEN UTC_TIMESTAMP()
+                   WHEN :status_archived = "Archived" THEN published_at
+                   ELSE published_at END
+             WHERE id = :id'
+        );
+        $statement->execute([
+            'title' => $title,
+            'summary' => $summary,
+            'body_html' => $body,
+            'featured_image_path' => $imagePath,
+            'status' => $status,
+            'status_published' => $status,
+            'status_archived' => $status,
+            'id' => (int) $matches[1],
+        ]);
+        if ($statement->rowCount() === 0) {
+            $check = db()->prepare('SELECT id FROM news_articles WHERE id = :id');
+            $check->execute(['id' => (int) $matches[1]]);
+            if ($check->fetchColumn() === false) {
+                throw new ApiException(404, 'News article not found.');
+            }
+        }
+        record_user_action((int) $user['id'], null, 'news.article_updated', 'news_article', (int) $matches[1], ['status' => $status]);
+        json_response(['data' => ['updated' => true]]);
+    }
+
+    if (preg_match('#^/admin/news/([1-9][0-9]*)$#', $route, $matches) === 1 && $method === 'DELETE') {
+        $statement = db()->prepare('DELETE FROM news_articles WHERE id = :id');
+        $statement->execute(['id' => (int) $matches[1]]);
+        if ($statement->rowCount() !== 1) {
+            throw new ApiException(404, 'News article not found.');
+        }
+        record_user_action((int) $user['id'], null, 'news.article_deleted', 'news_article', (int) $matches[1]);
+        json_response(['data' => ['deleted' => true]]);
+    }
 
     if ($route === '/dashboard' && $method === 'GET') {
         $pdo = db();
