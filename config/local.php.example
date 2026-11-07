@@ -1,0 +1,11 @@
+<?php
+return [
+    'app_key' => 'replace-with-the-generated-secret-from-the-setup-guide',
+    'database' => [
+        'host' => '127.0.0.1',
+        'port' => 3306,
+        'name' => 'trustgrid_africa',
+        'user' => 'trustgrid_app',
+        'password' => 'replace-with-your-database-password',
+    ],
+];

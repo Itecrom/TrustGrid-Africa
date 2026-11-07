@@ -1,0 +1,13 @@
+<?php
+declare(strict_types=1);
+require __DIR__ . '/app/bootstrap.php';
+if (isset($_SESSION['user_id'])) {
+    header('Location: ' . app_url('dashboard.php'));
+    exit;
+}
+$pageTitle = 'Create workspace';
+$pageDescription = 'Create a private TrustGrid Africa workspace for your organisation.';
+include __DIR__ . '/app/header.php';
+?>
+<main class="auth-page"><div class="auth-art"><img src="<?= h(app_url('assets/images/security-grid.svg')) ?>" alt="" /><p class="eyebrow">Start with a stronger foundation</p><h2>Make cybersecurity more accessible for your organisation.</h2><p>Your workspace starts with a private organisation profile and an administrator account. Invite your team as your needs grow.</p></div><section class="auth-card auth-card-register"><a class="back-home" href="<?= h(app_url('index.php')) ?>">← Back to TrustGrid Africa</a><p class="eyebrow">Get started</p><h1>Create your workspace</h1><p class="auth-intro">Set up your organisation’s private security workspace.</p><form class="stack-form" data-auth-form data-endpoint="/api/auth/register"><label>Your full name<input name="full_name" type="text" autocomplete="name" maxlength="120" required /></label><label>Work email<input name="email" type="email" autocomplete="email" maxlength="254" required /></label><label>Organisation name<input name="organization_name" type="text" autocomplete="organization" maxlength="160" required /></label><label>Country<select name="country" required><option value="">Select a country</option><option value="MW">Malawi</option><option value="ZM">Zambia</option><option value="TZ">Tanzania</option><option value="KE">Kenya</option><option value="UG">Uganda</option><option value="RW">Rwanda</option><option value="GH">Ghana</option><option value="NG">Nigeria</option><option value="ZA">South Africa</option><option value="BW">Botswana</option><option value="ET">Ethiopia</option><option value="ZW">Zimbabwe</option><option value="OTHER">Other African country</option></select></label><label>Create password<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="200" required /><small class="field-hint">Use at least 12 characters.</small></label><p class="form-message" data-form-message role="status" aria-live="polite"></p><button class="button button-primary button-wide" type="submit">Create secure workspace <span>→</span></button><p class="consent-note">By continuing, confirm you’re authorised to create an account for this organisation.</p></form><p class="auth-switch">Already have a workspace? <a href="<?= h(app_url('login.php')) ?>">Sign in</a></p></section></main>
+<?php include __DIR__ . '/app/footer.php'; ?>

@@ -1,0 +1,7 @@
+/config/local.php
+/logs/
+/vendor/
+.env
+.env.*
+!.env.example
+*.log
